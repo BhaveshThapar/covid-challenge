@@ -1,0 +1,48 @@
+# Multi-Source Covid-19 Detection — Default Configuration
+
+# Data
+data:
+  data_dir: "data"
+  image_size: 224
+  slices_per_scan: 32          # Number of slices sampled per scan during training
+  num_workers: 8
+  pin_memory: true
+
+# Model
+model:
+  backbone: "efficientnet_b3"
+  pretrained: true
+  embedding_dim: 1536          # EfficientNet-B3 feature dim
+  attention_hidden_dim: 256
+  classifier_hidden_dim: 256
+  dropout: 0.3
+  num_classes: 2
+
+# Training — Phase 1 (Slice-level pretraining)
+phase1:
+  epochs: 5
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 0.01
+  freeze_bn_epochs: 2
+  warmup_epochs: 1
+
+# Training — Phase 2 (Scan-level end-to-end)
+phase2:
+  epochs: 15
+  batch_size: 8                # scans per batch
+  lr: 3.0e-5
+  weight_decay: 0.01
+  warmup_epochs: 1
+  gradient_accumulation_steps: 4
+  use_amp: true                # Mixed precision
+
+# Evaluation
+eval:
+  slices_per_scan: -1          # -1 = use all slices
+  batch_size: 4
+
+# Misc
+seed: 42
+checkpoint_dir: "checkpoints"
+log_dir: "logs"
