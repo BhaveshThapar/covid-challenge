@@ -1,153 +1,145 @@
 """
-Model: EfficientNet-B3 backbone + Attention-based MIL pooling for scan-level classification.
+Model: DenseNet-121 backbone with RadImageNet pretrained weights for COVID-19 CT slice classification.
 
-Two modes:
-  - SliceClassifier: for Phase 1 slice-level pretraining
-  - CovidDetector:   for Phase 2 scan-level end-to-end training
+Single model class used for both training phases:
+  Phase 1: Frozen backbone, head-only fine-tuning
+  Phase 2: Gradual backbone unfreezing (denseblock4 → denseblock3)
+
+Scan-level predictions aggregate per-slice sigmoid probabilities by averaging.
 """
+import os
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import timm
+from torchvision import models
 
 
-class SliceClassifier(nn.Module):
+class DenseNetCovidClassifier(nn.Module):
     """
-    Phase 1: Slice-level classifier.
-    EfficientNet backbone + simple linear head.
+    DenseNet-121 for COVID-19 CT slice classification.
+    Binary output: logit > 0 → non-covid (1), logit <= 0 → covid (0).
+
+    DenseNet-121 layer names for unfreezing reference:
+        features.conv0, features.norm0, features.relu0, features.pool0
+        features.denseblock1, features.transition1
+        features.denseblock2, features.transition2
+        features.denseblock3, features.transition3
+        features.denseblock4, features.norm5
+        classifier
     """
 
-    def __init__(self, backbone_name="efficientnet_b3", pretrained=True,
-                 num_classes=2, dropout=0.3):
+    EMBED_DIM = 1024  # DenseNet-121 feature dimension before classifier
+
+    def __init__(self, pretrained_path: str = None, dropout: float = 0.4):
         super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
-        self.embed_dim = self.backbone.num_features  # 1536 for efficientnet_b3
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(self.embed_dim, num_classes),
-        )
 
-    def forward(self, x):
+        self.backbone = models.densenet121(weights=None)
+
+        if pretrained_path and os.path.exists(pretrained_path):
+            self._load_radimagenet(pretrained_path)
+        elif pretrained_path:
+            print(f"WARNING: RadImageNet weights not found at {pretrained_path!r}. "
+                  "Training from random init.")
+
+        # Replace classifier: Dropout(0.4) + Linear(1024, 1) — binary classification
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(self.EMBED_DIM, 1),
+        )
+        nn.init.kaiming_normal_(self.backbone.classifier[1].weight, mode="fan_out")
+        nn.init.zeros_(self.backbone.classifier[1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 3, H, W) — single slices
+            x: (B, 3, H, W) — individual slices
         Returns:
-            logits: (B, num_classes)
+            logits: (B, 1) — raw logits (apply sigmoid for probabilities)
         """
-        features = self.backbone(x)       # (B, embed_dim)
-        logits = self.head(features)      # (B, num_classes)
-        return logits
-
-    def extract_features(self, x):
-        """Extract features without classification head."""
         return self.backbone(x)
 
-
-class AttentionPooling(nn.Module):
-    """
-    Gated attention mechanism for MIL (Multiple Instance Learning).
-    Learns to weight the importance of each slice in a scan.
-    
-    Reference: Ilse et al., "Attention-based Deep Multiple Instance Learning", ICML 2018
-    """
-
-    def __init__(self, embed_dim: int, hidden_dim: int = 256):
-        super().__init__()
-        self.attention_V = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.Tanh(),
-        )
-        self.attention_U = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.Sigmoid(),
-        )
-        self.attention_w = nn.Linear(hidden_dim, 1)
-
-    def forward(self, h, mask=None):
+    def _load_radimagenet(self, path: str) -> None:
         """
+        Load RadImageNet pretrained weights.  Handles two checkpoint formats:
+          1. Direct state dict — keys start with 'features.' or 'classifier.'
+          2. Full serialised nn.Module — extracts .state_dict() automatically.
+        Classifier keys are always dropped so our new head is used.
+        """
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+
+        if isinstance(obj, dict) and any(
+            k.startswith("features.") or k.startswith("classifier.")
+            for k in obj.keys()
+        ):
+            # Direct state dict
+            sd = {k: v for k, v in obj.items() if not k.startswith("classifier")}
+        else:
+            # Full serialised module
+            src_sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
+            sd = {k: v for k, v in src_sd.items() if not k.startswith("classifier")}
+
+        missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
+        print(f"RadImageNet weights loaded from {path!r}. "
+              f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+
+    # ------------------------------------------------------------------
+    # Layer freezing / unfreezing helpers
+    # ------------------------------------------------------------------
+
+    def freeze_backbone(self) -> None:
+        """Freeze all backbone parameters; keep classifier trainable."""
+        for name, p in self.backbone.named_parameters():
+            if "classifier" not in name:
+                p.requires_grad = False
+
+    def unfreeze_block(self, *block_names: str) -> None:
+        """
+        Unfreeze parameters belonging to any of the specified block names.
+
+        Example:
+            model.unfreeze_block('denseblock4', 'norm5')
+            model.unfreeze_block('denseblock3', 'transition3')
+        """
+        for name, p in self.backbone.named_parameters():
+            if any(b in name for b in block_names):
+                p.requires_grad = True
+
+    def get_parameter_groups(self, head_lr: float, block_lrs: dict) -> list:
+        """
+        Build AdamW parameter groups with discriminative learning rates.
+
         Args:
-            h: (B, K, embed_dim) — slice embeddings
-            mask: (B, K) — 1 for valid slices, 0 for padding
+            head_lr:   Learning rate for the classifier head.
+            block_lrs: Dict mapping block name fragment → lr.
+                       e.g. {'denseblock4': 1e-4, 'norm5': 1e-4, 'denseblock3': 5e-5}
+
         Returns:
-            z: (B, embed_dim) — scan-level embedding
-            attention_weights: (B, K) — attention weights per slice
+            List of {'params': [...], 'lr': lr} dicts suitable for AdamW.
         """
-        # Gated attention
-        v = self.attention_V(h)          # (B, K, hidden_dim)
-        u = self.attention_U(h)          # (B, K, hidden_dim)
-        scores = self.attention_w(v * u).squeeze(-1)  # (B, K)
+        assigned: set = set()
+        groups = []
 
-        # Mask padding
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float("-inf"))
+        # Classifier head
+        head_params = [
+            p for n, p in self.backbone.named_parameters()
+            if "classifier" in n and p.requires_grad
+        ]
+        if head_params:
+            groups.append({"params": head_params, "lr": head_lr})
+            assigned.update(id(p) for p in head_params)
 
-        attention_weights = F.softmax(scores, dim=1)  # (B, K)
+        # Named backbone blocks (order matters: more specific first)
+        for block_name, lr in block_lrs.items():
+            block_params = [
+                p for n, p in self.backbone.named_parameters()
+                if block_name in n and p.requires_grad and id(p) not in assigned
+            ]
+            if block_params:
+                groups.append({"params": block_params, "lr": lr})
+                assigned.update(id(p) for p in block_params)
 
-        # Weighted sum
-        z = torch.bmm(attention_weights.unsqueeze(1), h).squeeze(1)  # (B, embed_dim)
-        return z, attention_weights
+        return groups
 
-
-class CovidDetector(nn.Module):
-    """
-    Phase 2: Full scan-level model.
-    EfficientNet backbone → Attention Pooling → Classification head.
-    """
-
-    def __init__(self, backbone_name="efficientnet_b3", pretrained=True,
-                 embedding_dim=1536, attention_hidden_dim=256,
-                 classifier_hidden_dim=256, num_classes=2, dropout=0.3):
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
-        self.embed_dim = self.backbone.num_features
-
-        self.attention = AttentionPooling(self.embed_dim, attention_hidden_dim)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(self.embed_dim, classifier_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(classifier_hidden_dim, num_classes),
-        )
-
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: (B, K, 3, H, W) — K slices per scan
-            mask: (B, K) — valid slice mask (optional)
-        Returns:
-            logits: (B, num_classes)
-            attention_weights: (B, K)
-        """
-        B, K, C, H, W = x.shape
-
-        # Extract features for all slices
-        x_flat = x.view(B * K, C, H, W)        # (B*K, 3, H, W)
-        features = self.backbone(x_flat)         # (B*K, embed_dim)
-        features = features.view(B, K, -1)       # (B, K, embed_dim)
-
-        # Attention pooling
-        scan_embed, attn_weights = self.attention(features, mask)  # (B, embed_dim), (B, K)
-
-        # Classify
-        logits = self.classifier(scan_embed)     # (B, num_classes)
-        return logits, attn_weights
-
-    @classmethod
-    def from_slice_classifier(cls, slice_model: SliceClassifier, config: dict):
-        """
-        Initialize CovidDetector from a pretrained SliceClassifier,
-        transferring the backbone weights.
-        """
-        model = cls(
-            backbone_name=config["model"]["backbone"],
-            pretrained=False,
-            embedding_dim=config["model"]["embedding_dim"],
-            attention_hidden_dim=config["model"]["attention_hidden_dim"],
-            classifier_hidden_dim=config["model"]["classifier_hidden_dim"],
-            num_classes=config["model"]["num_classes"],
-            dropout=config["model"]["dropout"],
-        )
-        # Copy backbone weights
-        model.backbone.load_state_dict(slice_model.backbone.state_dict())
-        return model
+    def trainable_param_count(self) -> int:
+        """Return the number of currently trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

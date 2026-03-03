@@ -1,46 +1,61 @@
 # Multi-Source Covid-19 Detection — Default Configuration
+# Aadit's pipeline: DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation
 
 # Data
 data:
   data_dir: "data"
   image_size: 224
-  slices_per_scan: 32          # Number of slices sampled per scan during training
+  slices_per_scan: 64          # Max slices sampled per scan during slice-level training
   num_workers: 8
   pin_memory: true
 
 # Model
 model:
-  backbone: "efficientnet_b3"
-  pretrained: true
-  embedding_dim: 1536          # EfficientNet-B3 feature dim
-  attention_hidden_dim: 256
-  classifier_hidden_dim: 256
-  dropout: 0.3
-  num_classes: 2
+  backbone: "densenet121"
+  pretrained_path: "checkpoints/radimagenet_densenet121.pt"
+  embedding_dim: 1024          # DenseNet-121 feature dim
+  dropout: 0.4
 
-# Training — Phase 1 (Slice-level pretraining)
+# Phase 1: Frozen backbone, head-only fine-tuning
 phase1:
-  epochs: 5
-  batch_size: 64
-  lr: 1.0e-4
-  weight_decay: 0.01
-  freeze_bn_epochs: 2
-  warmup_epochs: 1
+  epochs: 10
+  batch_size: 32               # Used by CenterBatchSampler
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 1             # Real linear warmup via SequentialLR
+  early_stop_patience: 10
+  label_smoothing: 0.05        # ε: hard labels → (ε/2, 1-ε/2)
+  use_focal_loss: false        # true → FocalLoss(gamma=2) instead of BCEWithLogitsLoss
 
-# Training — Phase 2 (Scan-level end-to-end)
+# Phase 2: Gradual backbone unfreezing
 phase2:
-  epochs: 15
-  batch_size: 8                # scans per batch
-  lr: 3.0e-5
-  weight_decay: 0.01
-  warmup_epochs: 1
-  gradient_accumulation_steps: 4
-  use_amp: true                # Mixed precision
+  # Sub-phase 2a: unfreeze denseblock4 + norm5
+  block4_epochs: 15
+  block4_lr: 1.0e-4
+
+  # Sub-phase 2b: additionally unfreeze denseblock3 + transition3
+  block3_epochs: 15
+  block3_lr: 5.0e-5
+
+  head_lr: 1.0e-3              # Classifier head LR (constant across both sub-phases)
+  weight_decay: 1.0e-4
+  warmup_restarts_T0: 5        # CosineAnnealingWarmRestarts T_0 (epochs per restart)
+  use_amp: true                # Mixed precision (FP16)
+  early_stop_patience: 10
+  label_smoothing: 0.05
+  use_focal_loss: false
+  full_val_every_n_epochs: 5   # Full-slice scan eval cadence (sanity check alongside fast val)
 
 # Evaluation
 eval:
-  slices_per_scan: -1          # -1 = use all slices
+  slices_per_scan: -1          # -1 = all slices (final evaluation)
+  val_slices_per_scan: 48      # Slices per scan during training validation (speed/accuracy tradeoff)
   batch_size: 4
+  threshold: 0.5               # Default threshold; overridden by tune_threshold sweep
+  threshold_lo: 0.3
+  threshold_hi: 0.7
+  threshold_steps: 41          # 0.01 increments over [0.30, 0.70]
+  tta_n: 4                     # TTA augmentations at inference (0 = disable)
 
 # Misc
 seed: 42

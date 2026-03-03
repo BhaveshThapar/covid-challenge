@@ -2,15 +2,16 @@
 
 Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
 
-## Architecture
+## Architecture (aadit-dev branch)
 
-**2-stage pipeline:**
-1. **Phase 1** — EfficientNet-B3 backbone pretrained on individual CT slices
-2. **Phase 2** — End-to-end scan-level training with gated attention MIL pooling
+**DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation:**
 
 ```
-CT Slices → EfficientNet-B3 → Attention Pooling → Covid / Non-Covid
+CT Slices → DenseNet-121 (RadImageNet) → Average Slice Probs → Threshold → Covid / Non-Covid
 ```
+
+Training uses progressive backbone unfreezing rather than a separate MIL aggregation stage.
+Scan-level predictions simply average per-slice sigmoid probabilities (no learned attention).
 
 **Metric:** Average macro F1 across 4 data centres
 
@@ -19,46 +20,47 @@ CT Slices → EfficientNet-B3 → Attention Pooling → Covid / Non-Covid
 ```
 covid-challenge/
 ├── src/
-│   ├── model.py       # EfficientNet-B3 + Attention MIL
-│   ├── dataset.py     # Slice & scan-level dataloaders
-│   ├── train.py       # 2-phase training loop
-│   ├── evaluate.py    # Per-source F1 evaluation
+│   ├── model.py       # DenseNetCovidClassifier (DenseNet-121 + RadImageNet)
+│   ├── dataset.py     # SliceDataset, ScanDataset, CenterBatchSampler, TTA transforms
+│   ├── train.py       # Phase 1 (frozen) + Phase 2 (gradual unfreeze) training
+│   ├── evaluate.py    # Scan-level inference, threshold tuning, TTA, per-source F1
 │   └── utils.py       # Metrics, checkpointing, early stopping
 ├── scripts/
-│   ├── extract_data.py   # Archive extraction & organization
-│   └── analyze_data.py   # Dataset statistics
+│   └── download_and_extract.py  # gdown download + archive extraction + dataset analysis
 ├── slurm/
-│   ├── extract.sbatch    # Data extraction SLURM job
-│   └── train.sbatch      # GPU training SLURM job
+│   ├── extract.sbatch    # Data download/extraction SLURM job (tron partition)
+│   └── train.sbatch      # GPU training SLURM job (scavenger partition)
 ├── configs/
 │   └── default.yaml      # Hyperparameters
 └── setup_env.sh           # Environment setup
 ```
 
-## Setup
+## Setup (on Nexus cluster)
 
 ```bash
-# 1. Create environment (requires Python 3.10 module on cluster)
+# 1. Clone the aadit-dev branch
+cd /fs/nexus-scratch/aadit
+git clone -b aadit-dev https://github.com/BhaveshThapar/covid-challenge.git covid-challenge
+cd covid-challenge
+
+# 2. Create environment
 bash setup_env.sh
 
-# Or manually:
-module load Python3/3.10.14
-python3 -m venv venv
+# 3. Download RadImageNet DenseNet-121 weights
 source venv/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install timm albumentations scikit-learn pandas Pillow opencv-python-headless tensorboard tqdm pyyaml unrar-cffi
+gdown --fuzzy "https://drive.google.com/file/d/1RHt2GnuOYlc_gcoTETtBDSW73mFyRAtR/view?usp=sharing" \
+      -O RadImageNet_pytorch.zip
+unzip -q RadImageNet_pytorch.zip -d radimagenet_weights
+cp radimagenet_weights/DenseNet121.pt checkpoints/radimagenet_densenet121.pt
 ```
 
 ## Data
 
-Download the competition archives into `datasets/` and then:
+Data is downloaded from Google Drive via gdown — no manual file placement needed.
 
 ```bash
-# Extract (via SLURM)
+# Extract data (submit SLURM job — tron partition, ~1-6 hours)
 sbatch slurm/extract.sbatch
-
-# Or locally
-python scripts/extract_data.py --datasets-dir datasets --data-dir data
 ```
 
 Expected structure after extraction:
@@ -71,6 +73,8 @@ data/
 │   ├── covid/
 │   └── non_covid/
 └── metadata/
+    ├── train_covid.csv
+    ├── train_non_covid.csv
     ├── val_covid.csv
     └── val_non_covid.csv
 ```
@@ -78,44 +82,87 @@ data/
 ## Training
 
 ```bash
-# Submit extraction then training as a pipeline
+# Submit training job (depends on extract completing first)
 EXTRACT_JOB=$(sbatch --parsable slurm/extract.sbatch)
 sbatch --dependency=afterok:$EXTRACT_JOB slurm/train.sbatch
 
-# Or run directly (with GPU)
-source venv/bin/activate
+# Or if data is already extracted:
+sbatch slurm/train.sbatch
+
+# Run directly (debug / local):
 python src/train.py --config configs/default.yaml --phase 0
 ```
+
+Training phases:
+- **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
+- **Phase 2a** (epochs 1–15): Unfreeze `denseblock4+norm5`, lr=1e-4
+- **Phase 2b** (epochs 1–15): Unfreeze `denseblock3+transition3`, lr=5e-5
+
+Checkpoints: `checkpoints/phase1_best.pt`, `checkpoints/phase2a_best.pt`, `checkpoints/phase2b_best.pt`, `checkpoints/best.pt`
 
 ## Evaluation
 
 ```bash
-python src/evaluate.py --checkpoint checkpoints/best.pt
+python src/evaluate.py \
+    --config configs/default.yaml \
+    --checkpoint checkpoints/best.pt \
+    --data-dir data \
+    --metadata-dir data/metadata
 ```
 
-Outputs per-source macro F1 and the final challenge score:
+Outputs per-source F1, tuned threshold, and final challenge score:
 ```
-  source_0:  0.xxxx
-  source_1:  0.xxxx
-  source_2:  0.xxxx
-  source_3:  0.xxxx
-  average:   0.xxxx  ★
+=======================================================
+PER-SOURCE MACRO F1 SCORES [No TTA]
+=======================================================
+    source_0: 0.xxxx
+    source_1: 0.xxxx
+    source_2: 0.xxxx
+    source_3: 0.xxxx
+     average: 0.xxxx  ★
+
+Tuned threshold (TTA):  0.xx  →  avg F1: 0.xxxx
+
+Final Challenge Score (P): 0.xxxx
 ```
+
+Flags:
+- `--no-tta` — skip TTA (faster)
+- `--no-tune-threshold` — use default threshold of 0.5
 
 ## Key Hyperparameters
 
 | Parameter | Value |
 |-----------|-------|
-| Backbone | EfficientNet-B3 |
+| Backbone | DenseNet-121 (RadImageNet pretrained) |
 | Image size | 224×224 |
-| Slices per scan (train) | 32 |
-| Phase 1 LR | 1e-4 |
-| Phase 2 LR | 3e-5 |
-| Mixed precision | FP16 |
-| Early stopping patience | 5 epochs |
+| Slices/scan (training) | 64 (uniform sample) |
+| Slices/scan (fast val) | 48 |
+| Phase 1 LR | 1e-3 (head only) |
+| Phase 2a LR | 1e-4 (denseblock4) |
+| Phase 2b LR | 5e-5 (denseblock3) |
+| Loss | BCEWithLogitsLoss + label smoothing (ε=0.05) |
+| Grad clipping | max_norm=1.0 |
+| Batch sampler | Center-stratified (equal center representation) |
+| Threshold | Tuned on val (0.30–0.70 sweep) |
+| TTA | 4 augmentations (identity, hflip, rotate ±15°) |
+| Early stopping patience | 10 epochs |
+
+## Updating from Laptop → Nexus
+
+```bash
+# Laptop: make changes, commit, push
+git add -p && git commit -m "..." && git push
+
+# Nexus: pull latest
+cd /fs/nexus-scratch/aadit/covid-challenge
+git pull
+sbatch slurm/train.sbatch
+```
 
 ## Requirements
 
 - Python 3.10+
 - PyTorch 2.x + CUDA 11.8
-- SLURM cluster with GPU (tested on UMD Nexus, `scavenger` partition)
+- SLURM cluster with GPU (tested on UMD Nexus, `tron`/`scavenger` partitions)
+- `unrar` system module: `module load unrar/7.0.9`

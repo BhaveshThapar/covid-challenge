@@ -13,54 +13,64 @@
 
 - We have thousands of CT scans, each stored as a **folder of JPEG images** (like regular photos)
 - Each folder = one patient's scan, and inside are ~375 photos (one per "slice" of the chest)
-- The data came compressed in `.rar` and `.zip` files (like a zip file you'd get from downloading something)
+- The data is stored on Google Drive and downloaded automatically using `gdown`
 - Split into:
-  - **Training data** — the scans the computer learns from (~26 GB)
+  - **Training data** — the scans the computer learns from (~1,200 patients)
   - **Validation data** — scans we test on to see how well it learned (308 patients)
 
 ---
 
 ## 🧠 How the Model Works (The "Brain")
 
-Think of it like **two students working together:**
+Think of it as **a doctor who starts by only studying one X-ray slice at a time, then gradually learns to use their full expertise on the whole scan:**
 
-### Student 1 — The Slice Inspector (`EfficientNet-B3`)
-- Looks at **one photo at a time** from a CT scan
-- Has already studied millions of regular photos (cats, dogs, cars...) so it already knows how to see shapes and patterns
-- We then teach it to also recognize Covid patterns in lung slices
-- It turns each photo into a list of **1,536 numbers** that describe what it sees
+### The Backbone — `DenseNet-121`
+- A well-known image recognition network, but ours starts with weights from **RadImageNet** — a version pretrained specifically on **medical imaging** (X-rays, MRIs, CT scans), not just everyday photos
+- This gives it a head-start at recognising the kinds of patterns that appear in medical images
+- It turns each 224×224 photo into **1,024 numbers** that describe what it sees
 
-### Student 2 — The Attention Reader (`Attention Pooling`)
-- Gets the descriptions from Student 1 for all 32 sampled slices of a scan
-- Figures out **which slices matter most** (e.g. the middle of the lung is more important than the very top or bottom)
-- Combines everything into one final answer: **Covid or Not Covid**
+### How We Get a Scan-Level Decision
+- We pass all the slices from one scan through the network individually
+- Each slice gets a probability: "how likely is this slice from a Covid patient?"
+- We **average these probabilities** across all slices to get one number per scan
+- If that number is above a tuned threshold → **Covid**; otherwise → **Not Covid**
 
 ---
 
 ## 🏋️ How We Teach It (Training)
 
-Teaching happens in **two rounds:**
+Teaching happens in **3 stages** — think of it like gradually handing a student more freedom:
 
-### Round 1 — Practice on single photos (5 rounds through all data)
-- Show the model one slice at a time
-- Tell it "this is from a Covid patient" or "this is not"
-- It slowly gets better at spotting Covid patterns
+### Stage 1 — Head-Only Fine-Tuning (10 epochs)
+- The DenseNet backbone is completely **frozen** — its weights don't change
+- Only the tiny classification head (2 layers) is trained
+- This is fast and avoids breaking the useful medical features already learned from RadImageNet
+- Learning rate: 1e-3
 
-### Round 2 — Practice on full scans (15 rounds through all data)
-- Now show it 32 slices from a scan at once
-- It has to make one decision for the whole patient
-- The "attention" part learns to focus on the most important slices
+### Stage 2a — Unfreeze the Top Block (15 epochs)
+- We unfreeze `denseblock4` (the last dense block) and let those layers adapt
+- The head keeps training at the same speed; denseblock4 trains slower (lr=1e-4) so we don't overwrite too fast
+- The scheduler restarts every 5 epochs (cosine annealing with warm restarts)
 
-After each round, we check how well it does on the test patients. We save the best version automatically.
+### Stage 2b — Unfreeze One Block Deeper (15 epochs)
+- We additionally unfreeze `denseblock3`, at an even slower rate (lr=5e-5)
+- The optimizer is reinitialised fresh to give each sub-phase a clean start
+- The best checkpoint across all stages is saved as `checkpoints/best.pt`
+
+After each epoch we check how well it does on the validation patients (using scan-level F1). We save the best version automatically and stop early if there's no improvement for 10 epochs.
 
 ---
 
 ## 📊 How We Score It
 
-- We calculate **F1 score** — a measure that penalizes the model if it misses Covid patients OR cries wolf too much
+- We calculate **F1 score** — a measure that penalises the model if it misses Covid patients OR cries wolf too much
 - We calculate it **separately for each hospital** (so it can't just be good at one hospital and bad at others)
 - **Final score = average F1 across all 4 hospitals**
 - A score of `1.0` = perfect, `0.0` = completely wrong
+
+### Extra tricks at evaluation time:
+- **Threshold tuning**: instead of always saying "≥0.5 → Covid", we sweep thresholds from 0.30 to 0.70 and pick whichever gives the best F1 on the validation set
+- **Test-time augmentation (TTA)**: for each scan, we process its slices 4 ways (original, flipped, rotated +15°, rotated -15°) and average the predictions — this usually adds 1–3% F1 for free
 
 ---
 
@@ -70,8 +80,8 @@ After each round, we check how well it does on the test patients. We save the be
 - We use a shared **supercomputer cluster** (UMD's Nexus) with powerful GPUs
 - We submit **SLURM jobs** — basically notes that say "please run this program when a GPU is free"
 - Two jobs:
-  1. **Extract job** — unpack all the zip/rar files onto the server (~4–6 hours, no GPU needed)
-  2. **Train job** — actually train the model (~6–12 hours on a GPU)
+  1. **Extract job** (`tron` partition — stable, no preemption) — download from Google Drive + unpack all the zip/rar files onto the server
+  2. **Train job** (`scavenger` partition — GPU-heavy) — actually train the model across all 3 stages
 
 ---
 
@@ -79,32 +89,32 @@ After each round, we check how well it does on the test patients. We save the be
 
 | File | What it does |
 |------|-------------|
-| `src/model.py` | Defines the "brain" — EfficientNet + Attention |
-| `src/dataset.py` | Teaches Python how to read and load the CT scan images |
-| `src/train.py` | Runs the two training rounds |
-| `src/evaluate.py` | Tests the trained model and prints the score for each hospital |
-| `src/utils.py` | Helper tools (saving models, computing scores, stopping early if not improving) |
-| `scripts/extract_data.py` | Unpacks the zip/rar files and organizes them into folders |
+| `src/model.py` | Defines the "brain" — DenseNet-121 with RadImageNet weights |
+| `src/dataset.py` | Teaches Python how to load CT slices, apply augmentations, and ensure batches have all 4 hospitals represented equally |
+| `src/train.py` | Runs all 3 training stages with learning rate schedules and gradient clipping |
+| `src/evaluate.py` | Tests the trained model: scans are evaluated by averaging their slice predictions, then threshold tuning and TTA are applied |
+| `src/utils.py` | Helper tools (saving models, computing per-hospital scores, stopping early if not improving) |
+| `scripts/download_and_extract.py` | Downloads data from Google Drive and organises it into the right folder structure |
 | `slurm/train.sbatch` | The "note" we hand to the supercomputer to train the model |
-| `slurm/extract.sbatch` | The "note" to unpack the data |
-| `configs/default.yaml` | All the settings (like learning speed, image size, etc.) in one place |
+| `slurm/extract.sbatch` | The "note" to download and unpack the data |
+| `configs/default.yaml` | All the settings (learning speed, image size, threshold sweep range, etc.) in one place |
 
 ---
 
 ## 🔁 End-to-End Flow
 
 ```
-Compressed archives (.rar/.zip)
-        ↓  unpack
-Organized folders (data/train/, data/val/)
-        ↓  load & augment
+Google Drive archives
+        ↓  gdown + unpack (extract.sbatch)
+Organised folders (data/train/, data/val/)
+        ↓  Load slices, augment, centre-balanced batches
 CT Slice Images (224×224 pixels)
-        ↓  EfficientNet-B3
-Feature vectors (1536 numbers per slice)
-        ↓  Attention Pooling (32 slices → 1 summary)
-Scan embedding
-        ↓  Classifier
+        ↓  DenseNet-121 (RadImageNet pretrained)
+Per-slice probability: P(non-covid)
+        ↓  Average across all slices in a scan
+Scan-level probability
+        ↓  Tuned threshold (swept 0.30–0.70)
 Covid / Non-Covid prediction
-        ↓  Compare to ground truth
-Per-hospital F1 score → Average = Final Score
+        ↓  Compare to ground truth, per hospital
+Per-hospital F1 score → Average = Final Score (P)
 ```
