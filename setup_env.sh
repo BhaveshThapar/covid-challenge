@@ -31,7 +31,7 @@ pip install \
     pyyaml
 
 echo "=== Installing archive tools ==="
-pip install py7zr rarfile
+pip install py7zr rarfile gdown
 
 echo "=== Creating project directories ==="
 mkdir -p data/{train/{covid,non_covid},val/{covid,non_covid},metadata}

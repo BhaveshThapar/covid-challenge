@@ -10,21 +10,17 @@
 #SBATCH --error=logs/extract_%j.err
 
 set -e
-cd /fs/nexus-scratch/bthapar/covid-challenge
+cd /fs/nexus-scratch/aadit/covid-challenge
 
 # Load environment
 module load Python3/3.10.14
 module load unrar/7.0.9
 source venv/bin/activate
 
-echo "Starting data extraction at $(date)"
-python scripts/extract_data.py \
+echo "Starting data download and extraction at $(date)"
+python scripts/download_and_extract.py \
     --datasets-dir datasets \
     --data-dir data \
-    --temp-dir data/_temp_extract \
-    --skip-validation
-
-echo "Running data analysis at $(date)"
-python scripts/analyze_data.py --data-dir data --metadata-dir data/metadata
+    --temp-dir data/_temp_extract
 
 echo "Done at $(date)"
