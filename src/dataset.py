@@ -53,12 +53,16 @@ def _load_image(path: str) -> np.ndarray:
 def _get_sorted_slices(scan_dir: str) -> list:
     """Get sorted list of JPEG slice paths in a scan directory."""
     exts = {".jpg", ".jpeg", ".png"}
-    slices = [
-        os.path.join(scan_dir, f)
-        for f in os.listdir(scan_dir)
-        if os.path.splitext(f)[1].lower() in exts
-    ]
-    # Sort numerically by filename
+    slices = []
+    for f in os.listdir(scan_dir):
+        stem, ext = os.path.splitext(f)
+        # Skip Mac metadata files (._0, ._1, etc.) and any non-numeric names
+        if ext.lower() not in exts:
+            continue
+        if not stem.lstrip("0123456789").strip() == "" or not stem.isdigit():
+            continue
+        slices.append(os.path.join(scan_dir, f))
+    # Sort numerically by filename stem
     slices.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
     return slices
 
