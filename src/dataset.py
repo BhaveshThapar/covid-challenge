@@ -120,10 +120,18 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
     source_map = {}
     if metadata_dir:
         for label_name, label_id in [("covid", 0), ("non_covid", 1)]:
-            csv_name = f"{split}_{label_name}.csv"
-            csv_path = os.path.join(metadata_dir, csv_name)
-            if not os.path.exists(csv_path):
-                print(f"WARNING: metadata CSV not found: {csv_path} — source will be -1")
+            # Try primary name first, then common alias (val → validation)
+            candidates = [f"{split}_{label_name}.csv"]
+            if split == "val":
+                candidates.append(f"validation_{label_name}.csv")
+            csv_path = next(
+                (os.path.join(metadata_dir, c) for c in candidates
+                 if os.path.exists(os.path.join(metadata_dir, c))),
+                None,
+            )
+            if csv_path is None:
+                tried = ", ".join(os.path.join(metadata_dir, c) for c in candidates)
+                print(f"WARNING: metadata CSV not found (tried: {tried}) — source will be -1")
                 continue
             df = pd.read_csv(csv_path)
             # Detect column names robustly
