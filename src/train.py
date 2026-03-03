@@ -234,7 +234,7 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
 
         if f1_dict["average"] > best_f1:
             best_f1 = f1_dict["average"]
-            ckpt_mgr.save(model, optimizer, epoch, best_f1, "phase1_best.pt")
+            ckpt_mgr.save_named(model, optimizer, epoch, best_f1, "phase1_best.pt")
             logger.info(f"  → New best F1: {best_f1:.4f} (saved phase1_best.pt)")
 
         if early_stop(f1_dict["average"]):
@@ -315,7 +315,7 @@ def _run_subphase(
 
         if f1_dict["average"] > best_f1:
             best_f1 = f1_dict["average"]
-            ckpt_mgr.save(model, optimizer, epoch, best_f1, f"{save_name}_best.pt")
+            ckpt_mgr.save_named(model, optimizer, epoch, best_f1, f"{save_name}_best.pt")
             logger.info(f"  → New best F1: {best_f1:.4f} (saved {save_name}_best.pt)")
 
         if early_stop(f1_dict["average"]):

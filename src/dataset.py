@@ -122,19 +122,51 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
         for label_name, label_id in [("covid", 0), ("non_covid", 1)]:
             csv_name = f"{split}_{label_name}.csv"
             csv_path = os.path.join(metadata_dir, csv_name)
-            if os.path.exists(csv_path):
-                df = pd.read_csv(csv_path)
-                for _, row in df.iterrows():
-                    source_map[(label_name, row["ct_scan_name"])] = int(row["data_centre"])
+            if not os.path.exists(csv_path):
+                print(f"WARNING: metadata CSV not found: {csv_path} — source will be -1")
+                continue
+            df = pd.read_csv(csv_path)
+            # Detect column names robustly
+            name_col = next((c for c in df.columns if "scan" in c.lower()), None)
+            ctr_col  = next((c for c in df.columns if any(
+                k in c.lower() for k in ("centre", "center", "source")
+            )), None)
+            if name_col is None or ctr_col is None:
+                print(f"WARNING: {csv_path} columns {list(df.columns)!r} — "
+                      f"expected a 'scan name' column and a 'centre' column. "
+                      f"source will be -1 for {label_name}.")
+                continue
+            if name_col != "ct_scan_name" or ctr_col != "data_centre":
+                print(f"INFO: {csv_path} — using columns '{name_col}' and '{ctr_col}'")
+            for _, row in df.iterrows():
+                source_map[(label_name, str(row[name_col]))] = int(row[ctr_col])
+
+    # Track which scan names were seen in each class (for missing-scan reporting)
+    csv_scan_names: dict = {}   # (label_name) -> set of names from CSV
+    for (lname, sname) in source_map:
+        csv_scan_names.setdefault(lname, set()).add(sname)
+
+    missing_dir: list = []      # in CSV but no directory on disk
+    empty_dir:   list = []      # directory exists but has no valid slice images
 
     for label_name, label_id in [("covid", 0), ("non_covid", 1)]:
         class_dir = os.path.join(split_dir, label_name)
         if not os.path.isdir(class_dir):
             continue
+
+        scans_on_disk = set()
         for scan_name in sorted(os.listdir(class_dir)):
             scan_dir = os.path.join(class_dir, scan_name)
             if not os.path.isdir(scan_dir):
                 continue
+            scans_on_disk.add(scan_name)
+
+            # Skip scans with no valid slice images
+            slices = _get_sorted_slices(scan_dir)
+            if not slices:
+                empty_dir.append(f"{label_name}/{scan_name}")
+                continue
+
             source = source_map.get((label_name, scan_name), -1)
             entries.append({
                 "scan_dir": scan_dir,
@@ -142,6 +174,20 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
                 "source": source,
                 "scan_name": scan_name,
             })
+
+        # CSV entries with no matching directory
+        for sname in sorted(csv_scan_names.get(label_name, set()) - scans_on_disk):
+            missing_dir.append(f"{label_name}/{sname}")
+
+    # Report at end (not per-scan, so logs stay clean)
+    if missing_dir:
+        print(f"MISSING ({split}, in CSV but no directory on disk — {len(missing_dir)} scan(s)):")
+        for s in missing_dir:
+            print(f"  {s}")
+    if empty_dir:
+        print(f"EMPTY ({split}, directory has no valid slice images — {len(empty_dir)} scan(s)):")
+        for s in empty_dir:
+            print(f"  {s}")
 
     return entries
 

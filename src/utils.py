@@ -151,8 +151,24 @@ class CheckpointManager:
                 os.remove(old_path)
         return path
 
+    def save_named(self, model, optimizer, epoch, score, filename: str) -> str:
+        """
+        Save to a fixed filename WITHOUT participating in the max_keep rotation.
+        Use this for named snapshots like 'phase1_best.pt', 'best.pt' that must
+        not be deleted by the rotation logic (which would happen if the same
+        filename is saved more than max_keep times via save()).
+        """
+        path = os.path.join(self.checkpoint_dir, filename)
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "score": score,
+        }, path)
+        return path
+
     def save_best(self, model, optimizer, epoch, score):
-        return self.save(model, optimizer, epoch, score, filename="best.pt")
+        return self.save_named(model, optimizer, epoch, score, "best.pt")
 
     @staticmethod
     def load(path, model, optimizer=None, device="cpu"):
