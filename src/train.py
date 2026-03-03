@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, CosineAnnealingWarmRestarts
 from tqdm import tqdm
@@ -143,7 +143,7 @@ def _run_epoch(
         # Label smoothing: 0 → ε/2, 1 → 1 − ε/2
         smooth_labels = labels.float() * (1 - label_smooth) + 0.5 * label_smooth
 
-        with autocast(enabled=use_amp):
+        with autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             logits = model(images).squeeze(-1)          # (B,)
             loss = criterion(logits, smooth_labels)
 
@@ -213,7 +213,7 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
     criterion = build_criterion(config, "phase1", pos_weight, device)
     label_smooth = p1.get("label_smoothing", 0.05)
     use_amp = False  # head-only: fast enough without AMP
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
     writer = SummaryWriter(log_dir=os.path.join(config["log_dir"], "phase1"))
@@ -278,7 +278,7 @@ def _run_subphase(
     param_groups = model.get_parameter_groups(head_lr, block_lrs)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=p2["weight_decay"])
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=p2["warmup_restarts_T0"])
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     pos_weight = torch.tensor([
         sum(1 for s in train_loader.dataset.samples if s[1] == 1) /
