@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=covid-extract
-#SBATCH --partition=scavenger
-#SBATCH --qos=scavenger
-#SBATCH --account=scavenger
+#SBATCH --partition=tron
+#SBATCH --account=nexus
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
-#SBATCH --time=06:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --output=logs/extract_%j.out
 #SBATCH --error=logs/extract_%j.err
 
