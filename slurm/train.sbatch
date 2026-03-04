@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=covid-train
+#SBATCH --job-name=covid-train-v2
 #SBATCH --partition=scavenger
 #SBATCH --qos=scavenger
 #SBATCH --account=scavenger
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 
@@ -21,6 +21,7 @@ echo "=== Job Info ==="
 echo "Node: $(hostname)"
 echo "GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "Start: $(date)"
+echo "Config: improved v2 — 256px, 24 slices, 20+30 epochs, label smoothing, TTA"
 echo "================"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -34,7 +35,7 @@ python src/train.py \
 
 echo "Training complete at $(date)"
 
-# Run evaluation
+# Run evaluation with TTA + threshold sweep
 python src/evaluate.py \
     --config configs/default.yaml \
     --checkpoint checkpoints/best.pt \

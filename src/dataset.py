@@ -10,6 +10,8 @@ import random
 from pathlib import Path
 from typing import Optional
 
+import cv2
+
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -25,10 +27,27 @@ from albumentations.pytorch import ToTensorV2
 def get_train_transforms(image_size: int = 224):
     return A.Compose([
         A.Resize(image_size, image_size),
+
+        # Geometric — simulate patient positioning variance across sites
         A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=15, p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.GaussNoise(p=0.2),
+        A.Affine(translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+                 scale=(0.85, 1.15), rotate=(-30, 30), p=0.7,
+                 border_mode=cv2.BORDER_CONSTANT),
+        A.ElasticTransform(alpha=50, sigma=5, p=0.2),
+
+        # Intensity — simulate scanner/protocol variance (critical for cross-source)
+        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.4),
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
+        A.RandomGamma(gamma_limit=(70, 130), p=0.4),
+        A.GaussNoise(std_range=(0.02, 0.1), p=0.3),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+
+        # Occlusion — act as strong regularizer
+        A.CoarseDropout(num_holes_range=(2, 8),
+                        hole_height_range=(image_size // 16, image_size // 8),
+                        hole_width_range=(image_size // 16, image_size // 8),
+                        fill=0, p=0.4),
+
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
@@ -162,16 +181,20 @@ class ScanDataset(Dataset):
     Used for Phase 2 end-to-end training with attention pooling.
     """
 
-    def __init__(self, scan_entries: list, transform=None, slices_per_scan: int = 32):
+    def __init__(self, scan_entries: list, transform=None, slices_per_scan: int = 32,
+                 sampling_strategy: str = "uniform"):
         """
         Args:
             scan_entries: list from build_scan_manifest
             transform: albumentations transform
             slices_per_scan: number of slices to sample per scan (-1 = all)
+            sampling_strategy: 'random' for training (different slices each epoch),
+                             'uniform' for eval (deterministic linspace)
         """
         self.entries = scan_entries
         self.transform = transform
         self.slices_per_scan = slices_per_scan
+        self.sampling_strategy = sampling_strategy
 
         # Pre-compute slice lists
         self.scan_slices = []
@@ -188,8 +211,12 @@ class ScanDataset(Dataset):
 
         # Sample k slices
         if k > 0 and k < len(all_slices):
-            # Uniform sampling across the scan
-            indices = np.linspace(0, len(all_slices) - 1, k, dtype=int)
+            if self.sampling_strategy == "random":
+                # Random sampling without replacement — different view each epoch
+                indices = sorted(random.sample(range(len(all_slices)), k))
+            else:
+                # Uniform deterministic (for eval)
+                indices = np.linspace(0, len(all_slices) - 1, k, dtype=int)
             selected = [all_slices[i] for i in indices]
         else:
             selected = all_slices
@@ -286,8 +313,10 @@ def build_scan_dataloaders(data_dir, metadata_dir, config):
     k_train = config["data"]["slices_per_scan"]
     k_val = config["eval"]["slices_per_scan"]
 
-    train_ds = ScanDataset(train_entries, get_train_transforms(img_size), k_train)
-    val_ds = ScanDataset(val_entries, get_val_transforms(img_size), k_val)
+    train_ds = ScanDataset(train_entries, get_train_transforms(img_size), k_train,
+                           sampling_strategy="random")
+    val_ds = ScanDataset(val_entries, get_val_transforms(img_size), k_val,
+                         sampling_strategy="uniform")
 
     train_loader = DataLoader(
         train_ds, batch_size=config["phase2"]["batch_size"],

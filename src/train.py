@@ -3,16 +3,26 @@ Training script for the Multi-Source Covid-19 Detection Challenge.
 
 Phase 1: Slice-level pretraining of the backbone
 Phase 2: End-to-end scan-level training with attention pooling
+
+Improvements over baseline:
+  - Label smoothing + optional Focal Loss
+  - Backbone freezing in early Phase 2 epochs + differential LR
+  - Step-level linear warmup + cosine decay scheduler
+  - Embedding-level mixup in Phase 2
+  - drop_path_rate for stochastic depth
 """
 import os
 import sys
 import argparse
+import math
 import time
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -23,11 +33,61 @@ from src.model import SliceClassifier, CovidDetector
 from src.dataset import (
     build_slice_dataloaders, build_scan_dataloaders,
 )
+from src.losses import FocalLoss
 from src.utils import (
     set_seed, load_config, get_logger, compute_per_source_f1,
     EarlyStopping, CheckpointManager,
 )
 
+
+# ---------- Scheduler ---------- #
+
+def get_cosine_warmup_scheduler(optimizer, warmup_steps, total_steps):
+    """Linear warmup for `warmup_steps`, then cosine decay to 0."""
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
+# ---------- Mixup ---------- #
+
+def embedding_mixup(embeddings, labels, alpha=0.2):
+    """
+    Mixup at the embedding level (Zhang et al., ICLR 2018).
+    Returns mixed embeddings and both label sets with mixing coefficient.
+    """
+    if alpha <= 0:
+        return embeddings, labels, labels, 1.0
+    lam = np.random.beta(alpha, alpha)
+    batch_size = embeddings.size(0)
+    index = torch.randperm(batch_size, device=embeddings.device)
+
+    mixed_embed = lam * embeddings + (1 - lam) * embeddings[index]
+    labels_a, labels_b = labels, labels[index]
+    return mixed_embed, labels_a, labels_b, lam
+
+
+# ---------- Loss builder ---------- #
+
+def build_criterion(config, phase="phase1"):
+    """Build loss function based on config."""
+    loss_type = config.get(phase, {}).get("loss_type", "cross_entropy")
+    label_smoothing = config.get(phase, {}).get("label_smoothing", 0.0)
+
+    if loss_type == "focal":
+        gamma = config.get(phase, {}).get("focal_gamma", 2.0)
+        return FocalLoss(gamma=gamma, label_smoothing=label_smoothing)
+    else:
+        return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+
+# ---------- Phase 1 ---------- #
 
 def train_phase1(config, data_dir, metadata_dir, device, logger):
     """Phase 1: Slice-level pretraining."""
@@ -45,6 +105,7 @@ def train_phase1(config, data_dir, metadata_dir, device, logger):
         pretrained=config["model"]["pretrained"],
         num_classes=config["model"]["num_classes"],
         dropout=config["model"]["dropout"],
+        drop_path_rate=config["model"].get("drop_path_rate", 0.0),
     ).to(device)
 
     # Enable gradient checkpointing to save GPU memory
@@ -60,10 +121,16 @@ def train_phase1(config, data_dir, metadata_dir, device, logger):
     )
     epochs = config["phase1"]["epochs"]
     warmup_epochs = config["phase1"]["warmup_epochs"]
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
+
+    # Step-level warmup + cosine scheduler
+    steps_per_epoch = len(train_loader)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = epochs * steps_per_epoch
+    scheduler = get_cosine_warmup_scheduler(optimizer, warmup_steps, total_steps)
 
     # Loss
-    criterion = nn.CrossEntropyLoss()
+    criterion = build_criterion(config, "phase1")
+    logger.info(f"Phase 1 loss: {criterion.__class__.__name__}")
 
     # Checkpoint
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
@@ -93,13 +160,12 @@ def train_phase1(config, data_dir, metadata_dir, device, logger):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             train_loss += loss.item()
             n_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-        if epoch > warmup_epochs:
-            scheduler.step()
+            pbar.set_postfix(loss=f"{loss.item():.4f}",
+                             lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
         avg_train_loss = train_loss / max(n_batches, 1)
 
@@ -149,6 +215,8 @@ def train_phase1(config, data_dir, metadata_dir, device, logger):
     return model
 
 
+# ---------- Phase 2 ---------- #
+
 def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=None):
     """Phase 2: Scan-level end-to-end training."""
     logger.info("=" * 60)
@@ -172,28 +240,76 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
             classifier_hidden_dim=config["model"]["classifier_hidden_dim"],
             num_classes=config["model"]["num_classes"],
             dropout=config["model"]["dropout"],
+            drop_path_rate=config["model"].get("drop_path_rate", 0.0),
         ).to(device)
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["phase2"]["lr"],
-        weight_decay=config["phase2"]["weight_decay"],
-    )
+    # Phase 2 config
     epochs = config["phase2"]["epochs"]
     warmup_epochs = config["phase2"]["warmup_epochs"]
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
     grad_accum = config["phase2"]["gradient_accumulation_steps"]
     use_amp = config["phase2"]["use_amp"]
+    freeze_backbone_epochs = config["phase2"].get("freeze_backbone_epochs", 0)
+    mixup_alpha = config["phase2"].get("mixup_alpha", 0.0)
+    backbone_lr_factor = config["phase2"].get("backbone_lr_factor", 0.1)
+
+    # Initially freeze backbone if configured
+    backbone_frozen = False
+    if freeze_backbone_epochs > 0:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        backbone_frozen = True
+        logger.info(f"Backbone frozen for first {freeze_backbone_epochs} epochs")
+
+    # Optimizer — differential LR: backbone at lower LR
+    def build_optimizer(model, config, differential=True):
+        base_lr = config["phase2"]["lr"]
+        wd = config["phase2"]["weight_decay"]
+        if differential and not backbone_frozen:
+            param_groups = [
+                {"params": model.backbone.parameters(), "lr": base_lr * backbone_lr_factor},
+                {"params": model.attention.parameters(), "lr": base_lr},
+                {"params": model.classifier.parameters(), "lr": base_lr},
+            ]
+            return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=wd)
+        else:
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            return torch.optim.AdamW(trainable, lr=base_lr, weight_decay=wd)
+
+    optimizer = build_optimizer(model, config, differential=False)
     scaler = GradScaler(enabled=use_amp)
 
-    criterion = nn.CrossEntropyLoss()
+    # Scheduler
+    steps_per_epoch = len(train_loader)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = epochs * steps_per_epoch
+    scheduler = get_cosine_warmup_scheduler(optimizer, warmup_steps, total_steps)
+
+    # Loss
+    criterion = build_criterion(config, "phase2")
+    logger.info(f"Phase 2 loss: {criterion.__class__.__name__}, mixup_alpha={mixup_alpha}")
+
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
     writer = SummaryWriter(log_dir=os.path.join(config["log_dir"], "phase2"))
-    early_stop = EarlyStopping(patience=5, mode="max")
+    patience = config["phase2"].get("early_stopping_patience", 5)
+    early_stop = EarlyStopping(patience=patience, mode="max")
     best_f1 = 0.0
 
+    global_step = 0
     for epoch in range(1, epochs + 1):
+        # Unfreeze backbone after freeze_backbone_epochs
+        if backbone_frozen and epoch == freeze_backbone_epochs + 1:
+            for p in model.backbone.parameters():
+                p.requires_grad = True
+            backbone_frozen = False
+            # Rebuild optimizer with differential LR
+            optimizer = build_optimizer(model, config, differential=True)
+            scaler = GradScaler(enabled=use_amp)
+            # Reset scheduler for remaining epochs
+            remaining_steps = (epochs - epoch + 1) * steps_per_epoch
+            scheduler = get_cosine_warmup_scheduler(
+                optimizer, warmup_steps=steps_per_epoch, total_steps=remaining_steps)
+            logger.info(f"Backbone unfrozen at epoch {epoch} with {backbone_lr_factor}x LR")
+
         model.train()
         train_loss = 0.0
         n_batches = 0
@@ -207,7 +323,28 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
 
             with autocast(enabled=use_amp):
                 logits, attn = model(images, masks)
-                loss = criterion(logits, labels)
+
+                # Embedding-level mixup (applied to logits for simplicity)
+                if mixup_alpha > 0 and model.training:
+                    # Re-run through attention to get scan embeddings
+                    B, K, C, H, W = images.shape
+                    x_flat = images.view(B * K, C, H, W)
+                    chunk_size = 8
+                    features_list = []
+                    for i in range(0, B * K, chunk_size):
+                        chunk = x_flat[i:i + chunk_size]
+                        feat = model.backbone(chunk)
+                        features_list.append(feat)
+                    features = torch.cat(features_list, dim=0).view(B, K, -1)
+                    scan_embed, _ = model.attention(features, masks)
+                    mixed_embed, labels_a, labels_b, lam = embedding_mixup(
+                        scan_embed, labels, mixup_alpha)
+                    logits = model.classifier(mixed_embed)
+                    loss = lam * criterion(logits, labels_a) + \
+                           (1 - lam) * criterion(logits, labels_b)
+                else:
+                    loss = criterion(logits, labels)
+
                 loss = loss / grad_accum
 
             scaler.scale(loss).backward()
@@ -216,13 +353,13 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                scheduler.step()
 
             train_loss += loss.item() * grad_accum
             n_batches += 1
-            pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}")
-
-        if epoch > warmup_epochs:
-            scheduler.step()
+            global_step += 1
+            pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}",
+                             lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
         avg_train_loss = train_loss / max(n_batches, 1)
 
@@ -260,6 +397,7 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
         writer.add_scalar("loss/train", avg_train_loss, epoch)
         writer.add_scalar("loss/val", avg_val_loss, epoch)
         writer.add_scalar("f1/average", f1_dict["average"], epoch)
+        writer.add_scalar("loss_ratio", avg_val_loss / max(avg_train_loss, 1e-8), epoch)
         for k, v in f1_dict.items():
             if k != "average":
                 writer.add_scalar(f"f1/{k}", v, epoch)
@@ -321,6 +459,7 @@ def main():
                 pretrained=False,
                 num_classes=config["model"]["num_classes"],
                 dropout=config["model"]["dropout"],
+                drop_path_rate=config["model"].get("drop_path_rate", 0.0),
             )
             CheckpointManager.load(args.resume_phase1, slice_model, device=device)
             logger.info(f"Loaded Phase 1 checkpoint: {args.resume_phase1}")

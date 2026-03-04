@@ -18,9 +18,10 @@ class SliceClassifier(nn.Module):
     """
 
     def __init__(self, backbone_name="efficientnet_b3", pretrained=True,
-                 num_classes=2, dropout=0.3):
+                 num_classes=2, dropout=0.3, drop_path_rate=0.0):
         super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained,
+                                          num_classes=0, drop_path_rate=drop_path_rate)
         self.embed_dim = self.backbone.num_features  # 1536 for efficientnet_b3
         self.head = nn.Sequential(
             nn.Dropout(dropout),
@@ -97,9 +98,11 @@ class CovidDetector(nn.Module):
 
     def __init__(self, backbone_name="efficientnet_b3", pretrained=True,
                  embedding_dim=1536, attention_hidden_dim=256,
-                 classifier_hidden_dim=256, num_classes=2, dropout=0.3):
+                 classifier_hidden_dim=256, num_classes=2, dropout=0.3,
+                 drop_path_rate=0.0):
         super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained,
+                                          num_classes=0, drop_path_rate=drop_path_rate)
         self.embed_dim = self.backbone.num_features
 
         # Enable gradient checkpointing to save ~60% GPU memory
@@ -159,6 +162,7 @@ class CovidDetector(nn.Module):
             classifier_hidden_dim=config["model"]["classifier_hidden_dim"],
             num_classes=config["model"]["num_classes"],
             dropout=config["model"]["dropout"],
+            drop_path_rate=config["model"].get("drop_path_rate", 0.0),
         )
         # Copy backbone weights
         model.backbone.load_state_dict(slice_model.backbone.state_dict())
