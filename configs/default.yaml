@@ -44,13 +44,13 @@ phase2:
   early_stop_patience: 10
   label_smoothing: 0.05
   use_focal_loss: false
-  full_val_every_n_epochs: 5   # Full-slice scan eval cadence (sanity check alongside fast val)
+  full_val_every_n_epochs: 999 # Disabled during training (OOM on full-slice); run via evaluate.py
 
 # Evaluation
 eval:
   slices_per_scan: -1          # -1 = all slices (final evaluation)
   val_slices_per_scan: 48      # Slices per scan during training validation (speed/accuracy tradeoff)
-  batch_size: 4
+  batch_size: 1
   threshold: 0.5               # Default threshold; overridden by tune_threshold sweep
   threshold_lo: 0.3
   threshold_hi: 0.7
