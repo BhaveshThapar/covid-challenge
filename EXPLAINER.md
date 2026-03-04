@@ -1,6 +1,6 @@
 # How Our Covid-19 Detector Works — Simple Explainer
 
-## 🏥 What Are We Trying to Do?
+## What Are We Trying to Do?
 
 - Doctors take **CT scans** of people's chests (like an X-ray but way more detailed — it takes hundreds of pictures of slices through your body like slices of bread)
 - Each CT scan comes from one of **4 different hospitals**
@@ -9,7 +9,7 @@
 
 ---
 
-## 📦 The Data
+## The Data
 
 - We have thousands of CT scans, each stored as a **folder of JPEG images** (like regular photos)
 - Each folder = one patient's scan, and inside are ~375 photos (one per "slice" of the chest)
@@ -17,10 +17,11 @@
 - Split into:
   - **Training data** — the scans the computer learns from (~1,200 patients)
   - **Validation data** — scans we test on to see how well it learned (308 patients)
+- Metadata CSVs (`train_covid.csv`, `validation_covid.csv`, etc.) tell us which hospital (0–3) each scan came from
 
 ---
 
-## 🧠 How the Model Works (The "Brain")
+## How the Model Works (The "Brain")
 
 Think of it as **a doctor who starts by only studying one X-ray slice at a time, then gradually learns to use their full expertise on the whole scan:**
 
@@ -37,7 +38,7 @@ Think of it as **a doctor who starts by only studying one X-ray slice at a time,
 
 ---
 
-## 🏋️ How We Teach It (Training)
+## How We Teach It (Training)
 
 Teaching happens in **3 stages** — think of it like gradually handing a student more freedom:
 
@@ -61,7 +62,7 @@ After each epoch we check how well it does on the validation patients (using sca
 
 ---
 
-## 📊 How We Score It
+## How We Score It
 
 - We calculate **F1 score** — a measure that penalises the model if it misses Covid patients OR cries wolf too much
 - We calculate it **separately for each hospital** (so it can't just be good at one hospital and bad at others)
@@ -71,29 +72,32 @@ After each epoch we check how well it does on the validation patients (using sca
 ### Extra tricks at evaluation time:
 - **Threshold tuning**: instead of always saying "≥0.5 → Covid", we sweep thresholds from 0.30 to 0.70 and pick whichever gives the best F1 on the validation set
 - **Test-time augmentation (TTA)**: for each scan, we process its slices 4 ways (original, flipped, rotated +15°, rotated -15°) and average the predictions — this usually adds 1–3% F1 for free
+- **Independent threshold re-sweep after TTA**: TTA shifts the probability distribution toward 0.5, so the optimal threshold changes — we re-sweep after TTA separately
 
 ---
 
-## 🖥️ How We Run It (The Cluster)
+## How We Run It (The Cluster)
 
 - We don't run this on a laptop — it would take weeks
 - We use a shared **supercomputer cluster** (UMD's Nexus) with powerful GPUs
 - We submit **SLURM jobs** — basically notes that say "please run this program when a GPU is free"
 - Two jobs:
   1. **Extract job** (`tron` partition — stable, no preemption) — download from Google Drive + unpack all the zip/rar files onto the server
-  2. **Train job** (`scavenger` partition — GPU-heavy) — actually train the model across all 3 stages
+  2. **Train job** (`tron` partition, `--qos=medium`) — train the model across all 3 stages on a newer GPU
+
+> **Why tron and not scavenger?** Scavenger jobs can be preempted (interrupted mid-run) by higher-priority users. Tron jobs run to completion. The `medium` QoS is needed to get 8 CPU workers and 64 GB RAM.
 
 ---
 
-## 📁 What Each File Does
+## What Each File Does
 
 | File | What it does |
 |------|-------------|
-| `src/model.py` | Defines the "brain" — DenseNet-121 with RadImageNet weights |
-| `src/dataset.py` | Teaches Python how to load CT slices, apply augmentations, and ensure batches have all 4 hospitals represented equally |
-| `src/train.py` | Runs all 3 training stages with learning rate schedules and gradient clipping |
+| `src/model.py` | Defines the "brain" — DenseNet-121 with RadImageNet weights, plus freeze/unfreeze helpers |
+| `src/dataset.py` | Teaches Python how to load CT slices, apply augmentations, and ensure batches have all 4 hospitals represented equally. Also detects missing/empty scan directories at startup. |
+| `src/train.py` | Runs all 3 training stages with learning rate schedules, gradient clipping, and label smoothing |
 | `src/evaluate.py` | Tests the trained model: scans are evaluated by averaging their slice predictions, then threshold tuning and TTA are applied |
-| `src/utils.py` | Helper tools (saving models, computing per-hospital scores, stopping early if not improving) |
+| `src/utils.py` | Helper tools (saving models with rotation-safe named checkpoints, computing per-hospital scores, stopping early if not improving) |
 | `scripts/download_and_extract.py` | Downloads data from Google Drive and organises it into the right folder structure |
 | `slurm/train.sbatch` | The "note" we hand to the supercomputer to train the model |
 | `slurm/extract.sbatch` | The "note" to download and unpack the data |
@@ -101,7 +105,7 @@ After each epoch we check how well it does on the validation patients (using sca
 
 ---
 
-## 🔁 End-to-End Flow
+## End-to-End Flow
 
 ```
 Google Drive archives
@@ -118,3 +122,15 @@ Covid / Non-Covid prediction
         ↓  Compare to ground truth, per hospital
 Per-hospital F1 score → Average = Final Score (P)
 ```
+
+---
+
+## Technical Notes (Bugs Fixed During Development)
+
+Several non-obvious issues were discovered and fixed during cluster runs:
+
+- **Validation CSV naming**: On disk the validation metadata files are named `validation_covid.csv` (not `val_covid.csv`). The code now tries both automatically.
+- **Checkpoint rotation**: PyTorch's `torch.save` for named checkpoints like `phase1_best.pt` was being deleted by the rotation logic after 3 saves. Fixed with a `save_named()` method that bypasses rotation.
+- **PyTorch 2.6 checkpoint loading**: PyTorch 2.6 changed `torch.load` to default to `weights_only=True`, rejecting checkpoints with numpy scalars. Fixed with `weights_only=False`.
+- **DenseNet float16 NaN**: Mixed precision training with float16 causes overflow in DenseNet's dense connections (which concatenate feature maps from many layers). Switched to bfloat16 (same dynamic range as float32) with automatic fallback to float32 on older GPUs.
+- **Full-slice validation OOM**: Running full-slice evaluation (all ~200 slices per scan) with batch_size=4 during training caused out-of-memory on a 16 GB GPU. Disabled full-slice eval during training (`full_val_every_n_epochs: 999`) — it still runs at the end via `evaluate.py`. Eval batch size also reduced to 1.

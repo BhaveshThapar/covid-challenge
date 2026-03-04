@@ -29,7 +29,7 @@ covid-challenge/
 │   └── download_and_extract.py  # gdown download + archive extraction + dataset analysis
 ├── slurm/
 │   ├── extract.sbatch    # Data download/extraction SLURM job (tron partition)
-│   └── train.sbatch      # GPU training SLURM job (scavenger partition)
+│   └── train.sbatch      # GPU training SLURM job (tron partition, qos=medium)
 ├── configs/
 │   └── default.yaml      # Hyperparameters
 └── setup_env.sh           # Environment setup
@@ -75,23 +75,40 @@ data/
 └── metadata/
     ├── train_covid.csv
     ├── train_non_covid.csv
-    ├── val_covid.csv
-    └── val_non_covid.csv
+    ├── validation_covid.csv       # NOTE: named "validation_", not "val_"
+    └── validation_non_covid.csv   # code handles both automatically
 ```
+
+> **Note:** The validation metadata CSVs on disk are named `validation_*.csv`. The code tries
+> `val_*.csv` first and falls back to `validation_*.csv` automatically — no manual renaming needed.
 
 ## Training
 
 ```bash
-# Submit training job (depends on extract completing first)
-EXTRACT_JOB=$(sbatch --parsable slurm/extract.sbatch)
-sbatch --dependency=afterok:$EXTRACT_JOB slurm/train.sbatch
-
-# Or if data is already extracted:
+# Submit full training job (Phase 1 → Phase 2 sequentially):
 sbatch slurm/train.sbatch
+
+# Or submit Phase 2 only (if phase1_best.pt already exists):
+BASH_ENV=/usr/share/Modules/init/bash sbatch \
+  --job-name=covid-phase2 \
+  --partition=tron --account=nexus --qos=medium \
+  --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=10:00:00 \
+  --output=logs/phase2_%j.out --error=logs/phase2_%j.err \
+  --wrap='cd /fs/nexus-scratch/aadit/covid-challenge &&
+          source /usr/share/Modules/init/bash &&
+          module load Python3/3.10.14 &&
+          source venv/bin/activate &&
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+          python -u src/train.py --config configs/default.yaml \
+            --data-dir data --metadata-dir data/metadata --phase 2'
 
 # Run directly (debug / local):
 python src/train.py --config configs/default.yaml --phase 0
 ```
+
+> **Partition:** Use `tron --qos=medium` (not `scavenger`) for training. Tron gives newer GPUs
+> (no preemption) and `--qos=medium` is required to get 8 CPUs + 64 GB RAM
+> (default QoS caps at 4 CPUs / 32 GB which is insufficient for `num_workers=8`).
 
 Training phases:
 - **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
@@ -147,6 +164,19 @@ Flags:
 | Threshold | Tuned on val (0.30–0.70 sweep) |
 | TTA | 4 augmentations (identity, hflip, rotate ±15°) |
 | Early stopping patience | 10 epochs |
+| AMP | bfloat16 on Ampere GPUs; falls back to float32 on Turing/Pascal |
+| Eval batch size | 1 scan at a time (prevents OOM on full-slice eval) |
+
+## Known Issues & Cluster Notes
+
+| Issue | Fix applied |
+|-------|-------------|
+| `val_covid.csv` not found (all sources = -1) | Code now tries `validation_*.csv` as fallback |
+| `FileNotFoundError: phase1_best.pt` (checkpoint rotation) | `save_named()` bypasses max_keep rotation |
+| `UnpicklingError` loading checkpoints (PyTorch 2.6) | `weights_only=False` in `CheckpointManager.load()` |
+| NaN loss in Phase 2 (float16 DenseNet overflow) | AMP uses bfloat16; falls back to float32 if unsupported |
+| OOM on full-slice validation (V100, 16 GB) | `full_val_every_n_epochs: 999`; `eval.batch_size: 1` |
+| 1-2 missing scan directories | Logged at startup, training continues without them |
 
 ## Updating from Laptop → Nexus
 
@@ -163,6 +193,6 @@ sbatch slurm/train.sbatch
 ## Requirements
 
 - Python 3.10+
-- PyTorch 2.x + CUDA 11.8
-- SLURM cluster with GPU (tested on UMD Nexus, `tron`/`scavenger` partitions)
+- PyTorch 2.6+ + CUDA 11.8
+- SLURM cluster with GPU (tested on UMD Nexus, `tron` partition, qos=medium)
 - `unrar` system module: `module load unrar/7.0.9`
