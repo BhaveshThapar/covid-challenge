@@ -35,7 +35,7 @@ phase2:
 
   # Sub-phase 2b: additionally unfreeze denseblock3 + transition3
   block3_epochs: 15
-  block3_lr: 5.0e-5
+  block3_lr: 3.0e-5
 
   head_lr: 1.0e-3              # Classifier head LR (constant across both sub-phases)
   weight_decay: 1.0e-4

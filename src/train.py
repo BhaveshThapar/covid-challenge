@@ -112,7 +112,7 @@ def evaluate_scans(
             all_labels.extend(labels.numpy())
             all_sources.extend(sources.numpy())
 
-    return compute_per_source_f1(all_labels, all_preds, all_sources)
+    return compute_per_source_f1(all_labels, all_preds, all_sources, strict_labels=False)
 
 
 # ---------------------------------------------------------------------------
