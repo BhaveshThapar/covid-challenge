@@ -69,18 +69,21 @@ data/
 ├── train/
 │   ├── covid/          # ct_scan_*/  folders of JPEG slices
 │   └── non_covid/
-├── val/
-│   ├── covid/
-│   └── non_covid/
-└── metadata/
-    ├── train_covid.csv
-    ├── train_non_covid.csv
-    ├── validation_covid.csv       # NOTE: named "validation_", not "val_"
-    └── validation_non_covid.csv   # code handles both automatically
+└── val/
+    ├── covid/
+    └── non_covid/
+
+datasets/               # metadata CSVs live here (alongside raw archives)
+├── train_covid.csv
+├── train_non_covid.csv
+├── validation_covid.csv       # NOTE: named "validation_", not "val_"
+└── validation_non_covid.csv   # code handles both automatically
 ```
 
-> **Note:** The validation metadata CSVs on disk are named `validation_*.csv`. The code tries
-> `val_*.csv` first and falls back to `validation_*.csv` automatically — no manual renaming needed.
+> **Note:** The metadata CSVs are in `datasets/` (alongside the raw archive files), **not**
+> `data/metadata/`. Always pass `--metadata-dir datasets` to train.py and evaluate.py.
+> The validation CSV names use `validation_*.csv`; the code tries `val_*.csv` first and
+> falls back to `validation_*.csv` automatically.
 
 ## Training
 
@@ -100,7 +103,7 @@ BASH_ENV=/usr/share/Modules/init/bash sbatch \
           source venv/bin/activate &&
           PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
           python -u src/train.py --config configs/default.yaml \
-            --data-dir data --metadata-dir data/metadata --phase 2'
+            --data-dir data --metadata-dir datasets --phase 2'
 
 # Run directly (debug / local):
 python src/train.py --config configs/default.yaml --phase 0
@@ -124,7 +127,7 @@ python src/evaluate.py \
     --config configs/default.yaml \
     --checkpoint checkpoints/best.pt \
     --data-dir data \
-    --metadata-dir data/metadata
+    --metadata-dir datasets
 ```
 
 Outputs per-source F1, tuned threshold, and final challenge score:

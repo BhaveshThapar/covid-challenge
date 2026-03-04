@@ -27,7 +27,7 @@ echo "================"
 python src/train.py \
     --config configs/default.yaml \
     --data-dir data \
-    --metadata-dir data/metadata \
+    --metadata-dir datasets \
     --phase 0
 
 echo "Training complete at $(date)"
@@ -37,6 +37,6 @@ python src/evaluate.py \
     --config configs/default.yaml \
     --checkpoint checkpoints/best.pt \
     --data-dir data \
-    --metadata-dir data/metadata
+    --metadata-dir datasets
 
 echo "Done at $(date)"
