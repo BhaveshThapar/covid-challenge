@@ -142,21 +142,17 @@ class CheckpointManager:
             "optimizer_state_dict": optimizer.state_dict(),
             "score": score,
         }, path)
-        self.saved.append((score, path))
-        # Keep only top-k
-        self.saved.sort(key=lambda x: x[0], reverse=True)
-        while len(self.saved) > self.max_keep:
-            _, old_path = self.saved.pop()
-            if os.path.exists(old_path):
-                os.remove(old_path)
         return path
 
     def save_best(self, model, optimizer, epoch, score):
-        return self.save(model, optimizer, epoch, score, filename="best.pt")
+        """Save as best.pt — always overwrites, never pruned."""
+        path = self.save(model, optimizer, epoch, score, filename="best.pt")
+        print(f"  Saved best checkpoint: {path} (F1={score:.4f})")
+        return path
 
     @staticmethod
     def load(path, model, optimizer=None, device="cpu"):
-        ckpt = torch.load(path, map_location=device)
+        ckpt = torch.load(path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         if optimizer and "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])

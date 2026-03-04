@@ -47,6 +47,11 @@ def train_phase1(config, data_dir, metadata_dir, device, logger):
         dropout=config["model"]["dropout"],
     ).to(device)
 
+    # Enable gradient checkpointing to save GPU memory
+    if hasattr(model.backbone, 'set_grad_checkpointing'):
+        model.backbone.set_grad_checkpointing(enable=True)
+        logger.info("Gradient checkpointing enabled for Phase 1")
+
     # Optimizer & scheduler
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -298,6 +303,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger = get_logger("train", os.path.join(config["log_dir"], "train.log"))
     logger.info(f"Device: {device}")
+    if device.type == 'cuda':
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {gpu_mem:.1f} GB")
     logger.info(f"Config: {config}")
 
     slice_model = None
@@ -316,6 +324,11 @@ def main():
             )
             CheckpointManager.load(args.resume_phase1, slice_model, device=device)
             logger.info(f"Loaded Phase 1 checkpoint: {args.resume_phase1}")
+
+        # Free Phase 1 model memory before Phase 2
+        if slice_model is not None and device.type == 'cuda':
+            logger.info("Clearing GPU memory before Phase 2...")
+            torch.cuda.empty_cache()
 
         train_phase2(config, args.data_dir, args.metadata_dir, device, logger, slice_model)
 

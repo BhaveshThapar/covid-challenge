@@ -4,8 +4,8 @@
 data:
   data_dir: "data"
   image_size: 224
-  slices_per_scan: 32          # Number of slices sampled per scan during training
-  num_workers: 8
+  slices_per_scan: 16          # reduced from 32 for 12GB VRAM
+  num_workers: 4          # reduced from 8 to save CPU memory
   pin_memory: true
 
 # Model
@@ -21,26 +21,27 @@ model:
 # Training — Phase 1 (Slice-level pretraining)
 phase1:
   epochs: 5
-  batch_size: 64
+  batch_size: 8           # reduced from 16 - TITAN X has only 12GB
   lr: 1.0e-4
   weight_decay: 0.01
   freeze_bn_epochs: 2
   warmup_epochs: 1
+  max_val_slices_per_scan: 32  # cap val slices to save memory
 
 # Training — Phase 2 (Scan-level end-to-end)
 phase2:
   epochs: 15
-  batch_size: 8                # scans per batch
+  batch_size: 4                # reduced from 8 for 12GB VRAM
   lr: 3.0e-5
   weight_decay: 0.01
   warmup_epochs: 1
-  gradient_accumulation_steps: 4
-  use_amp: true                # Mixed precision
+  gradient_accumulation_steps: 8   # increased to keep effective batch ~32
+  use_amp: true
 
 # Evaluation
 eval:
-  slices_per_scan: -1          # -1 = use all slices
-  batch_size: 4
+  slices_per_scan: 32           # capped to prevent OOM (was -1 = all)
+  batch_size: 2                 # reduced from 4 for safety
 
 # Misc
 seed: 42

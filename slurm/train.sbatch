@@ -23,6 +23,8 @@ echo "GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || e
 echo "Start: $(date)"
 echo "================"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Run both phases
 python src/train.py \
     --config configs/default.yaml \

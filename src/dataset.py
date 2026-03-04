@@ -56,10 +56,11 @@ def _get_sorted_slices(scan_dir: str) -> list:
     slices = []
     for f in os.listdir(scan_dir):
         stem, ext = os.path.splitext(f)
-        # Skip Mac metadata files (._0, ._1, etc.) and any non-numeric names
+        # Only include files with numeric names and valid image extensions
+        # This skips Mac metadata files (._0, ._1, etc.) and other junk
         if ext.lower() not in exts:
             continue
-        if not stem.lstrip("0123456789").strip() == "" or not stem.isdigit():
+        if not stem.isdigit():
             continue
         slices.append(os.path.join(scan_dir, f))
     # Sort numerically by filename stem
@@ -89,6 +90,7 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
                 for _, row in df.iterrows():
                     source_map[(label_name, row["ct_scan_name"])] = int(row["data_centre"])
 
+    skipped = 0
     for label_name, label_id in [("covid", 0), ("non_covid", 1)]:
         class_dir = os.path.join(split_dir, label_name)
         if not os.path.isdir(class_dir):
@@ -96,6 +98,10 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
         for scan_name in sorted(os.listdir(class_dir)):
             scan_dir = os.path.join(class_dir, scan_name)
             if not os.path.isdir(scan_dir):
+                continue
+            # Skip scans with no valid slices (e.g. only Mac metadata files)
+            if len(_get_sorted_slices(scan_dir)) == 0:
+                skipped += 1
                 continue
             source = source_map.get((label_name, scan_name), -1)
             entries.append({
@@ -105,6 +111,8 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
                 "scan_name": scan_name,
             })
 
+    if skipped > 0:
+        print(f"  [WARNING] Skipped {skipped} empty scan directories in {split}")
     return entries
 
 
@@ -189,10 +197,18 @@ class ScanDataset(Dataset):
         # Load and transform
         images = []
         for path in selected:
-            img = _load_image(path)
-            if self.transform:
-                img = self.transform(image=img)["image"]
-            images.append(img)
+            try:
+                img = _load_image(path)
+                if self.transform:
+                    img = self.transform(image=img)["image"]
+                images.append(img)
+            except Exception:
+                continue  # skip corrupt/unreadable slices
+
+        # Guard: if no images loaded, return a dummy black tensor
+        if len(images) == 0:
+            img_size = 224
+            images = [torch.zeros(3, img_size, img_size)]
 
         images = torch.stack(images)  # (K, 3, H, W)
         label = entry["label"]
@@ -236,8 +252,10 @@ def build_slice_dataloaders(data_dir, metadata_dir, config):
     val_entries = build_scan_manifest(data_dir, "val", metadata_dir)
 
     img_size = config["data"]["image_size"]
+    max_val_slices = config["phase1"].get("max_val_slices_per_scan", 64)
+
     train_ds = SliceDataset(train_entries, get_train_transforms(img_size), max_slices_per_scan=64)
-    val_ds = SliceDataset(val_entries, get_val_transforms(img_size))
+    val_ds = SliceDataset(val_entries, get_val_transforms(img_size), max_slices_per_scan=max_val_slices)
 
     # Class-balanced sampling for training
     labels = [s[1] for s in train_ds.samples]
@@ -245,14 +263,15 @@ def build_slice_dataloaders(data_dir, metadata_dir, config):
     weights = 1.0 / class_counts[labels]
     sampler = WeightedRandomSampler(weights, len(weights))
 
+    num_workers = config["data"].get("num_workers", 4)
     train_loader = DataLoader(
         train_ds, batch_size=config["phase1"]["batch_size"],
-        sampler=sampler, num_workers=config["data"]["num_workers"],
+        sampler=sampler, num_workers=num_workers,
         pin_memory=config["data"]["pin_memory"], drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=config["phase1"]["batch_size"],
-        shuffle=False, num_workers=config["data"]["num_workers"],
+        shuffle=False, num_workers=num_workers,
         pin_memory=config["data"]["pin_memory"],
     )
     return train_loader, val_loader

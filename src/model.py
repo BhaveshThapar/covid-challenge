@@ -92,6 +92,7 @@ class CovidDetector(nn.Module):
     """
     Phase 2: Full scan-level model.
     EfficientNet backbone → Attention Pooling → Classification head.
+    Memory-safe: uses gradient checkpointing and chunked slice processing.
     """
 
     def __init__(self, backbone_name="efficientnet_b3", pretrained=True,
@@ -100,6 +101,10 @@ class CovidDetector(nn.Module):
         super().__init__()
         self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
         self.embed_dim = self.backbone.num_features
+
+        # Enable gradient checkpointing to save ~60% GPU memory
+        if hasattr(self.backbone, 'set_grad_checkpointing'):
+            self.backbone.set_grad_checkpointing(enable=True)
 
         self.attention = AttentionPooling(self.embed_dim, attention_hidden_dim)
 
@@ -121,10 +126,17 @@ class CovidDetector(nn.Module):
         """
         B, K, C, H, W = x.shape
 
-        # Extract features for all slices
-        x_flat = x.view(B * K, C, H, W)        # (B*K, 3, H, W)
-        features = self.backbone(x_flat)         # (B*K, embed_dim)
-        features = features.view(B, K, -1)       # (B, K, embed_dim)
+        # Process slices in chunks to prevent OOM
+        # Instead of (B*K) at once, do chunks of `chunk_size`
+        x_flat = x.view(B * K, C, H, W)
+        chunk_size = 8  # max slices through backbone at once
+        features_list = []
+        for i in range(0, B * K, chunk_size):
+            chunk = x_flat[i:i + chunk_size]
+            feat = self.backbone(chunk)
+            features_list.append(feat)
+        features = torch.cat(features_list, dim=0)  # (B*K, embed_dim)
+        features = features.view(B, K, -1)           # (B, K, embed_dim)
 
         # Attention pooling
         scan_embed, attn_weights = self.attention(features, mask)  # (B, embed_dim), (B, K)
