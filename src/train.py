@@ -82,7 +82,8 @@ def build_criterion(config, phase="phase1"):
 
     if loss_type == "focal":
         gamma = config.get(phase, {}).get("focal_gamma", 2.0)
-        return FocalLoss(gamma=gamma, label_smoothing=label_smoothing)
+        alpha = config.get(phase, {}).get("focal_alpha", None)
+        return FocalLoss(alpha=alpha, gamma=gamma, label_smoothing=label_smoothing)
     else:
         return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -322,27 +323,16 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
             masks = masks.to(device)
 
             with autocast(enabled=use_amp):
-                logits, attn = model(images, masks)
-
-                # Embedding-level mixup (applied to logits for simplicity)
+                # Efficient mixup: single backbone pass via forward_features
                 if mixup_alpha > 0 and model.training:
-                    # Re-run through attention to get scan embeddings
-                    B, K, C, H, W = images.shape
-                    x_flat = images.view(B * K, C, H, W)
-                    chunk_size = 8
-                    features_list = []
-                    for i in range(0, B * K, chunk_size):
-                        chunk = x_flat[i:i + chunk_size]
-                        feat = model.backbone(chunk)
-                        features_list.append(feat)
-                    features = torch.cat(features_list, dim=0).view(B, K, -1)
-                    scan_embed, _ = model.attention(features, masks)
+                    scan_embed, attn = model.forward_features(images, masks)
                     mixed_embed, labels_a, labels_b, lam = embedding_mixup(
                         scan_embed, labels, mixup_alpha)
                     logits = model.classifier(mixed_embed)
                     loss = lam * criterion(logits, labels_a) + \
                            (1 - lam) * criterion(logits, labels_b)
                 else:
+                    logits, attn = model(images, masks)
                     loss = criterion(logits, labels)
 
                 loss = loss / grad_accum

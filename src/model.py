@@ -118,19 +118,20 @@ class CovidDetector(nn.Module):
             nn.Linear(classifier_hidden_dim, num_classes),
         )
 
-    def forward(self, x, mask=None):
+    def forward_features(self, x, mask=None):
         """
+        Extract scan-level embedding without classification.
+        
         Args:
             x: (B, K, 3, H, W) — K slices per scan
             mask: (B, K) — valid slice mask (optional)
         Returns:
-            logits: (B, num_classes)
-            attention_weights: (B, K)
+            scan_embed: (B, embed_dim) — scan-level embedding
+            attention_weights: (B, K) — attention weights per slice
         """
         B, K, C, H, W = x.shape
 
         # Process slices in chunks to prevent OOM
-        # Instead of (B*K) at once, do chunks of `chunk_size`
         x_flat = x.view(B * K, C, H, W)
         chunk_size = 8  # max slices through backbone at once
         features_list = []
@@ -143,8 +144,20 @@ class CovidDetector(nn.Module):
 
         # Attention pooling
         scan_embed, attn_weights = self.attention(features, mask)  # (B, embed_dim), (B, K)
+        return scan_embed, attn_weights
 
-        # Classify
+    def forward(self, x, mask=None):
+        """
+        Full forward pass: backbone → attention → classifier.
+        
+        Args:
+            x: (B, K, 3, H, W) — K slices per scan
+            mask: (B, K) — valid slice mask (optional)
+        Returns:
+            logits: (B, num_classes)
+            attention_weights: (B, K)
+        """
+        scan_embed, attn_weights = self.forward_features(x, mask)
         logits = self.classifier(scan_embed)     # (B, num_classes)
         return logits, attn_weights
 
