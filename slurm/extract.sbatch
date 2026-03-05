@@ -9,7 +9,7 @@
 #SBATCH --error=logs/extract_%j.err
 
 set -e
-cd /fs/nexus-scratch/aadit/covid-challenge
+cd /fs/nexus-scratch/anant04/covid-challenge
 
 # Load environment
 module load Python3/3.10.14
