@@ -1,8 +1,8 @@
 """
 Training script for the Multi-Source Covid-19 Detection Challenge.
 
-Phase 1: Frozen DenseNet-121 backbone, head-only training (slice-level)
-Phase 2: Gradual backbone unfreezing — sub-phase 2a (denseblock4) then 2b (denseblock3)
+Phase 1: Frozen DINOv2 ViT-B/14 backbone, head-only training (slice-level)
+Phase 2: Gradual backbone unfreezing — sub-phase 2a (last 2 blocks + norm) then 2b (last 4 blocks)
 
 Both phases train at the slice level; validation is at the scan level via evaluate_scans().
 """
@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.model import DenseNetCovidClassifier
+from src.model import DINOv2CovidClassifier
 from src.dataset import (
     build_slice_dataloaders, build_scan_manifest,
     ScanDataset, get_val_transforms, scan_collate_fn,
@@ -62,7 +62,7 @@ def build_criterion(config: dict, phase_key: str, pos_weight: torch.Tensor, devi
 # ---------------------------------------------------------------------------
 
 def evaluate_scans(
-    model: DenseNetCovidClassifier,
+    model: DINOv2CovidClassifier,
     val_entries: list,
     config: dict,
     device,
@@ -120,7 +120,7 @@ def evaluate_scans(
 # ---------------------------------------------------------------------------
 
 def _run_epoch(
-    model: DenseNetCovidClassifier,
+    model: DINOv2CovidClassifier,
     train_loader,
     criterion,
     optimizer,
@@ -173,7 +173,7 @@ def _log_f1(f1_dict: dict, writer: SummaryWriter, epoch: int, logger, prefix: st
 # Phase 1: Frozen backbone, head-only
 # ---------------------------------------------------------------------------
 
-def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger) -> DenseNetCovidClassifier:
+def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger) -> DINOv2CovidClassifier:
     logger.info("=" * 60)
     logger.info("PHASE 1: Frozen Backbone — Head-Only Fine-Tuning")
     logger.info("=" * 60)
@@ -181,10 +181,8 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
     train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
     logger.info(f"Train slices: {len(train_loader.dataset)}, Val scans: {len(val_entries)}")
 
-    # Model — load RadImageNet weights, freeze backbone
-    pretrained_path = config["model"].get("pretrained_path", "")
-    model = DenseNetCovidClassifier(
-        pretrained_path=pretrained_path,
+    # Model — load DINOv2 ViT-B/14 from torch hub, freeze backbone
+    model = DINOv2CovidClassifier(
         dropout=config["model"]["dropout"],
     ).to(device)
     model.freeze_backbone()
@@ -258,7 +256,7 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
 # ---------------------------------------------------------------------------
 
 def _run_subphase(
-    model: DenseNetCovidClassifier,
+    model: DINOv2CovidClassifier,
     train_loader,
     val_entries: list,
     config: dict,
@@ -333,8 +331,8 @@ def _run_subphase(
 
 def train_phase2(
     config: dict, data_dir: str, metadata_dir: str, device, logger,
-    phase1_model: DenseNetCovidClassifier = None,
-) -> DenseNetCovidClassifier:
+    phase1_model: DINOv2CovidClassifier = None,
+) -> DINOv2CovidClassifier:
     logger.info("=" * 60)
     logger.info("PHASE 2: Gradual Backbone Unfreezing")
     logger.info("=" * 60)
@@ -344,7 +342,7 @@ def train_phase2(
     # Load Phase 1 checkpoint if model not passed in
     if phase1_model is None:
         phase1_path = os.path.join(config["checkpoint_dir"], f"{config['run_name']}_phase1_best.pt")
-        model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+        model = DINOv2CovidClassifier(dropout=config["model"]["dropout"]).to(device)
         CheckpointManager.load(phase1_path, model, device=device)
         logger.info(f"Loaded Phase 1 checkpoint from {phase1_path}")
     else:
@@ -355,11 +353,13 @@ def train_phase2(
     writer = SummaryWriter(log_dir=os.path.join(config["log_dir"], "phase2"))
     overall_best_f1 = 0.0
 
-    # ---- Sub-phase 2a: unfreeze denseblock4 + norm5 ----
-    logger.info("Sub-phase 2a: Unfreezing denseblock4 + norm5")
-    model.unfreeze_block("denseblock4", "norm5")
+    # ---- Sub-phase 2a: unfreeze last 2 transformer blocks + norm ----
+    logger.info("Sub-phase 2a: Unfreezing blocks.11, blocks.10, norm")
+    model.unfreeze_blocks_by_index([10, 11], also_norm=True)
 
     rn = config["run_name"]
+    block_last_lr = p2.get("blocks_last_lr", 1e-4)
+    block_mid_lr = p2.get("blocks_mid_lr", 5e-5)
 
     f1_2a, ep_offset = _run_subphase(
         model=model,
@@ -372,21 +372,21 @@ def train_phase2(
         ckpt_mgr=ckpt_mgr,
         phase_key="phase2",
         head_lr=p2["head_lr"],
-        block_lrs={"denseblock4": p2["block4_lr"], "norm5": p2["block4_lr"]},
-        n_epochs=p2["block4_epochs"],
+        block_lrs={"blocks.11": block_last_lr, "blocks.10": block_last_lr, "norm": block_last_lr},
+        n_epochs=p2.get("blocks_last_epochs", p2.get("block4_epochs", 15)),
         save_name=f"{rn}_phase2a",
         epoch_offset=0,
     )
     overall_best_f1 = max(overall_best_f1, f1_2a)
 
-    # ---- Sub-phase 2b: additionally unfreeze denseblock3 + transition3 ----
-    logger.info("Sub-phase 2b: Unfreezing denseblock3 + transition3")
+    # ---- Sub-phase 2b: additionally unfreeze blocks.9, blocks.8 ----
+    logger.info("Sub-phase 2b: Unfreezing blocks.9, blocks.8")
 
     # Reload best from 2a to start 2b from a clean state
     CheckpointManager.load(
         os.path.join(config["checkpoint_dir"], f"{rn}_phase2a_best.pt"), model, device=device
     )
-    model.unfreeze_block("denseblock3", "transition3")
+    model.unfreeze_blocks_by_index([8, 9, 10, 11], also_norm=True)
 
     f1_2b, _ = _run_subphase(
         model=model,
@@ -400,10 +400,10 @@ def train_phase2(
         phase_key="phase2",
         head_lr=p2["head_lr"],
         block_lrs={
-            "denseblock4": p2["block4_lr"], "norm5": p2["block4_lr"],
-            "denseblock3": p2["block3_lr"], "transition3": p2["block3_lr"],
+            "blocks.11": block_last_lr, "blocks.10": block_last_lr, "norm": block_last_lr,
+            "blocks.9": block_mid_lr, "blocks.8": block_mid_lr,
         },
-        n_epochs=p2["block3_epochs"],
+        n_epochs=p2.get("blocks_mid_epochs", p2.get("block3_epochs", 15)),
         save_name=f"{rn}_phase2b",
         epoch_offset=ep_offset,
     )
@@ -444,9 +444,9 @@ def train_phase2b_only(
     phase2a_path = os.path.join(config["checkpoint_dir"], f"{rn}_phase2a_best.pt")
 
     # Build model with correct freeze state for 2b, then load weights
-    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    model = DINOv2CovidClassifier(dropout=config["model"]["dropout"]).to(device)
     model.freeze_backbone()
-    model.unfreeze_block("denseblock4", "norm5", "denseblock3", "transition3")
+    model.unfreeze_blocks_by_index([8, 9, 10, 11], also_norm=True)
     epoch_2a, f1_2a = CheckpointManager.load(phase2a_path, model, device=device)
     logger.info(f"Loaded Phase 2a checkpoint (epoch {epoch_2a}, F1={f1_2a:.4f})")
 
@@ -465,12 +465,13 @@ def train_phase2b_only(
         phase_key="phase2",
         head_lr=p2["head_lr"],
         block_lrs={
-            "denseblock4": p2["block4_lr"], "norm5": p2["block4_lr"],
-            "denseblock3": p2["block3_lr"], "transition3": p2["block3_lr"],
+            "blocks.11": p2.get("blocks_last_lr", 1e-4), "blocks.10": p2.get("blocks_last_lr", 1e-4),
+            "norm": p2.get("blocks_last_lr", 1e-4),
+            "blocks.9": p2.get("blocks_mid_lr", 5e-5), "blocks.8": p2.get("blocks_mid_lr", 5e-5),
         },
-        n_epochs=p2["block3_epochs"],
+        n_epochs=p2.get("blocks_mid_epochs", p2.get("block3_epochs", 15)),
         save_name=f"{rn}_phase2b",
-        epoch_offset=p2["block4_epochs"],  # match TensorBoard x-axis of full phase2 run
+        epoch_offset=p2.get("blocks_last_epochs", p2.get("block4_epochs", 15)),  # match TensorBoard x-axis
     )
 
     # ovr_best = best of 2a vs 2b
@@ -490,7 +491,7 @@ def train_phase2b_only(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train DenseNet-121 Covid-19 Detector")
+    parser = argparse.ArgumentParser(description="Train DINOv2 ViT-B/14 Covid-19 Detector")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
@@ -499,8 +500,6 @@ def main():
                              "3=phase2b only (resume from existing phase2a_best.pt)")
     parser.add_argument("--run-name", type=str, default="run",
                         help="Prefix for checkpoint filenames, e.g. 'v1' → v1_phase1_best.pt, v1_ovr_best.pt")
-    parser.add_argument("--radimagenet-weights", type=str, default=None,
-                        help="Path to RadImageNet DenseNet-121 checkpoint (overrides config)")
     parser.add_argument("--overfit-batches", type=int, default=0,
                         help="If > 0, overfit on this many batches (debug mode)")
     args = parser.parse_args()
@@ -512,10 +511,6 @@ def main():
     os.makedirs(config["log_dir"], exist_ok=True)
 
     config["run_name"] = args.run_name
-
-    # CLI override for RadImageNet weights path
-    if args.radimagenet_weights:
-        config["model"]["pretrained_path"] = args.radimagenet_weights
 
     set_seed(config["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
