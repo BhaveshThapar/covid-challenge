@@ -13,6 +13,10 @@
 set -e
 cd /fs/nexus-scratch/anant04/covid-challenge
 
+# PyTorch hub cache in scratch (home dir full)
+export TORCH_HOME=/fs/nexus-scratch/anant04/.cache/torch
+mkdir -p "$TORCH_HOME"
+
 # Load environment
 module load Python3/3.10.14
 source venv/bin/activate
