@@ -423,6 +423,69 @@ def train_phase2(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2b only (resume from existing phase2a checkpoint)
+# ---------------------------------------------------------------------------
+
+def train_phase2b_only(
+    config: dict, data_dir: str, metadata_dir: str, device, logger,
+) -> None:
+    """
+    Run only Phase 2b, loading from the existing {run_name}_phase2a_best.pt checkpoint.
+    Use --phase 3 when Phase 2a already completed but the job was killed before 2b finished.
+    """
+    logger.info("=" * 60)
+    logger.info("PHASE 2b ONLY: Deepening Backbone Unfreezing (resume)")
+    logger.info("=" * 60)
+
+    train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
+
+    rn = config["run_name"]
+    p2 = config["phase2"]
+    phase2a_path = os.path.join(config["checkpoint_dir"], f"{rn}_phase2a_best.pt")
+
+    # Build model with correct freeze state for 2b, then load weights
+    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    model.freeze_backbone()
+    model.unfreeze_block("denseblock4", "norm5", "denseblock3", "transition3")
+    epoch_2a, f1_2a = CheckpointManager.load(phase2a_path, model, device=device)
+    logger.info(f"Loaded Phase 2a checkpoint (epoch {epoch_2a}, F1={f1_2a:.4f})")
+
+    ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
+    writer = SummaryWriter(log_dir=os.path.join(config["log_dir"], "phase2b"))
+
+    f1_2b, _ = _run_subphase(
+        model=model,
+        train_loader=train_loader,
+        val_entries=val_entries,
+        config=config,
+        device=device,
+        logger=logger,
+        writer=writer,
+        ckpt_mgr=ckpt_mgr,
+        phase_key="phase2",
+        head_lr=p2["head_lr"],
+        block_lrs={
+            "denseblock4": p2["block4_lr"], "norm5": p2["block4_lr"],
+            "denseblock3": p2["block3_lr"], "transition3": p2["block3_lr"],
+        },
+        n_epochs=p2["block3_epochs"],
+        save_name=f"{rn}_phase2b",
+        epoch_offset=p2["block4_epochs"],  # match TensorBoard x-axis of full phase2 run
+    )
+
+    # ovr_best = best of 2a vs 2b
+    best_sub = f"{rn}_phase2b" if f1_2b >= f1_2a else f"{rn}_phase2a"
+    best_src = os.path.join(config["checkpoint_dir"], f"{best_sub}_best.pt")
+    best_dst = os.path.join(config["checkpoint_dir"], f"{rn}_ovr_best.pt")
+    import shutil
+    shutil.copy2(best_src, best_dst)
+    logger.info(
+        f"Best overall F1: {max(f1_2a, f1_2b):.4f} (from {best_sub}) → saved as {rn}_ovr_best.pt"
+    )
+    writer.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -431,8 +494,9 @@ def main():
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
-    parser.add_argument("--phase", type=int, choices=[1, 2, 0], default=0,
-                        help="Phase to run: 1=head-only, 2=gradual unfreeze, 0=both")
+    parser.add_argument("--phase", type=int, choices=[0, 1, 2, 3], default=0,
+                        help="Phase to run: 0=all, 1=head-only, 2=both subphases, "
+                             "3=phase2b only (resume from existing phase2a_best.pt)")
     parser.add_argument("--run-name", type=str, default="run",
                         help="Prefix for checkpoint filenames, e.g. 'v1' → v1_phase1_best.pt, v1_ovr_best.pt")
     parser.add_argument("--radimagenet-weights", type=str, default=None,
@@ -466,6 +530,9 @@ def main():
 
     if args.phase in (0, 2):
         train_phase2(config, args.data_dir, args.metadata_dir, device, logger, phase1_model)
+
+    if args.phase == 3:
+        train_phase2b_only(config, args.data_dir, args.metadata_dir, device, logger)
 
 
 if __name__ == "__main__":
