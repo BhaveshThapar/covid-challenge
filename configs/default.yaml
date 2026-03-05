@@ -1,5 +1,5 @@
-# Multi-Source Covid-19 Detection — Default Configuration
-# Aadit's pipeline: DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation
+# Multi-Source Covid-19 Detection — DINOv2 ViT-B/14
+# Slice-level training, scan-level evaluation
 
 # Data
 data:
@@ -11,9 +11,8 @@ data:
 
 # Model
 model:
-  backbone: "densenet121"
-  pretrained_path: "checkpoints/radimagenet_densenet121.pt"
-  embedding_dim: 1024          # DenseNet-121 feature dim
+  backbone: "dinov2_vitb14"
+  embedding_dim: 768           # ViT-B/14 feature dim
   dropout: 0.4
 
 # Phase 1: Frozen backbone, head-only fine-tuning
@@ -27,29 +26,29 @@ phase1:
   label_smoothing: 0.05        # ε: hard labels → (ε/2, 1-ε/2)
   use_focal_loss: false        # true → FocalLoss(gamma=2) instead of BCEWithLogitsLoss
 
-# Phase 2: Gradual backbone unfreezing
+# Phase 2: Gradual backbone unfreezing (ViT transformer blocks)
+# Sub-phase 2a: unfreeze last 2 blocks + norm (blocks.11, blocks.10, norm)
+# Sub-phase 2b: additionally unfreeze blocks.9, blocks.8
 phase2:
-  # Sub-phase 2a: unfreeze denseblock4 + norm5
-  block4_epochs: 15
-  block4_lr: 1.0e-4
+  blocks_last_epochs: 15       # Unfreeze blocks.11, blocks.10, norm
+  blocks_last_lr: 1.0e-4
 
-  # Sub-phase 2b: additionally unfreeze denseblock3 + transition3
-  block3_epochs: 15
-  block3_lr: 5.0e-5
+  blocks_mid_epochs: 15        # Additionally unfreeze blocks.9, blocks.8
+  blocks_mid_lr: 5.0e-5
 
   head_lr: 1.0e-3              # Classifier head LR (constant across both sub-phases)
   weight_decay: 1.0e-4
   warmup_restarts_T0: 5        # CosineAnnealingWarmRestarts T_0 (epochs per restart)
-  use_amp: true                # Mixed precision (FP16)
+  use_amp: true                # Mixed precision (bfloat16)
   early_stop_patience: 10
   label_smoothing: 0.05
   use_focal_loss: false
-  full_val_every_n_epochs: 999 # Disabled during training (OOM on full-slice); run via evaluate.py
+  full_val_every_n_epochs: 999 # Disabled during training (OOM); run via evaluate.py
 
 # Evaluation
 eval:
   slices_per_scan: -1          # -1 = all slices (final evaluation)
-  val_slices_per_scan: 48      # Slices per scan during training validation (speed/accuracy tradeoff)
+  val_slices_per_scan: 48      # Slices per scan during training validation
   batch_size: 1
   threshold: 0.5               # Default threshold; overridden by tune_threshold sweep
   threshold_lo: 0.3

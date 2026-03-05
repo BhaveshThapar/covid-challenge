@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.model import DenseNetCovidClassifier
+from src.model import DINOv2CovidClassifier
 from src.dataset import (
     build_scan_manifest, ScanDataset, RawSliceScanDataset,
     get_val_transforms, get_tta_transforms, scan_collate_fn,
@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader
 # ---------------------------------------------------------------------------
 
 def collect_scan_probs(
-    model: DenseNetCovidClassifier,
+    model: DINOv2CovidClassifier,
     val_entries: list,
     config: dict,
     device,
@@ -88,7 +88,7 @@ def collect_scan_probs(
 
 
 def collect_scan_probs_tta(
-    model: DenseNetCovidClassifier,
+    model: DINOv2CovidClassifier,
     val_entries: list,
     config: dict,
     device,
@@ -197,7 +197,7 @@ def print_results(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate DenseNet-121 Covid-19 Detector")
+    parser = argparse.ArgumentParser(description="Evaluate DINOv2 ViT-B/14 Covid-19 Detector")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data-dir", type=str, default="data")
@@ -215,7 +215,7 @@ def main():
     use_amp = config.get("phase2", {}).get("use_amp", True)
 
     # Model
-    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    model = DINOv2CovidClassifier(dropout=config["model"]["dropout"]).to(device)
     epoch, score = CheckpointManager.load(args.checkpoint, model, device=device)
     print(f"Loaded checkpoint from epoch {epoch}, training score={score:.4f}")
 

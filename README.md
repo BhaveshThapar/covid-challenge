@@ -2,16 +2,16 @@
 
 Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
 
-## Architecture (aadit-dev branch)
+## Architecture (DINOv2 branch)
 
-**DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation:**
+**DINOv2 ViT-B/14 + slice-level training, scan-level evaluation:**
 
 ```
-CT Slices → DenseNet-121 (RadImageNet) → Average Slice Probs → Threshold → Covid / Non-Covid
+CT Slices → DINOv2 ViT-B/14 (self-supervised) → Average Slice Probs → Threshold → Covid / Non-Covid
 ```
 
-Training uses progressive backbone unfreezing rather than a separate MIL aggregation stage.
-Scan-level predictions simply average per-slice sigmoid probabilities (no learned attention).
+Training uses progressive backbone unfreezing (Phase 1: frozen; Phase 2a: last 2 blocks; Phase 2b: last 4 blocks).
+Scan-level predictions average per-slice sigmoid probabilities (no learned attention).
 
 **Metric:** Average macro F1 across 4 data centres
 
@@ -20,7 +20,7 @@ Scan-level predictions simply average per-slice sigmoid probabilities (no learne
 ```
 covid-challenge/
 ├── src/
-│   ├── model.py       # DenseNetCovidClassifier (DenseNet-121 + RadImageNet)
+│   ├── model.py       # DINOv2CovidClassifier (DINOv2 ViT-B/14)
 │   ├── dataset.py     # SliceDataset, ScanDataset, CenterBatchSampler, TTA transforms
 │   ├── train.py       # Phase 1 (frozen) + Phase 2 (gradual unfreeze) training
 │   ├── evaluate.py    # Scan-level inference, threshold tuning, TTA, per-source F1
@@ -46,12 +46,7 @@ cd covid-challenge
 # 2. Create environment
 bash setup_env.sh
 
-# 3. Download RadImageNet DenseNet-121 weights
-source venv/bin/activate
-gdown --fuzzy "https://drive.google.com/file/d/1RHt2GnuOYlc_gcoTETtBDSW73mFyRAtR/view?usp=sharing" \
-      -O RadImageNet_pytorch.zip
-unzip -q RadImageNet_pytorch.zip -d radimagenet_weights
-cp radimagenet_weights/DenseNet121.pt checkpoints/radimagenet_densenet121.pt
+# DINOv2 weights are downloaded automatically via torch.hub on first run (no manual download).
 ```
 
 ## Data
@@ -115,17 +110,17 @@ python src/train.py --config configs/default.yaml --phase 0
 
 Training phases:
 - **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
-- **Phase 2a** (epochs 1–15): Unfreeze `denseblock4+norm5`, lr=1e-4
-- **Phase 2b** (epochs 1–15): Unfreeze `denseblock3+transition3`, lr=5e-5
+- **Phase 2a** (epochs 1–15): Unfreeze last 2 blocks + norm, lr=1e-4
+- **Phase 2b** (epochs 1–15): Unfreeze last 4 blocks + norm, lr=5e-5
 
-Checkpoints: `checkpoints/phase1_best.pt`, `checkpoints/phase2a_best.pt`, `checkpoints/phase2b_best.pt`, `checkpoints/best.pt`
+Checkpoints: `checkpoints/{run_name}_phase1_best.pt`, `{run_name}_phase2a_best.pt`, `{run_name}_phase2b_best.pt`, `{run_name}_ovr_best.pt`
 
 ## Evaluation
 
 ```bash
 python src/evaluate.py \
     --config configs/default.yaml \
-    --checkpoint checkpoints/best.pt \
+    --checkpoint checkpoints/v1_ovr_best.pt \
     --data-dir data \
     --metadata-dir datasets
 ```
@@ -154,13 +149,13 @@ Flags:
 
 | Parameter | Value |
 |-----------|-------|
-| Backbone | DenseNet-121 (RadImageNet pretrained) |
+| Backbone | DINOv2 ViT-B/14 (self-supervised, torch.hub) |
 | Image size | 224×224 |
 | Slices/scan (training) | 64 (uniform sample) |
 | Slices/scan (fast val) | 48 |
 | Phase 1 LR | 1e-3 (head only) |
-| Phase 2a LR | 1e-4 (denseblock4) |
-| Phase 2b LR | 5e-5 (denseblock3) |
+| Phase 2a LR | 1e-4 (blocks 10–11, norm) |
+| Phase 2b LR | 5e-5 (blocks 8–9) |
 | Loss | BCEWithLogitsLoss + label smoothing (ε=0.05) |
 | Grad clipping | max_norm=1.0 |
 | Batch sampler | Center-stratified (equal center representation) |
@@ -177,7 +172,7 @@ Flags:
 | `val_covid.csv` not found (all sources = -1) | Code now tries `validation_*.csv` as fallback |
 | `FileNotFoundError: phase1_best.pt` (checkpoint rotation) | `save_named()` bypasses max_keep rotation |
 | `UnpicklingError` loading checkpoints (PyTorch 2.6) | `weights_only=False` in `CheckpointManager.load()` |
-| NaN loss in Phase 2 (float16 DenseNet overflow) | AMP uses bfloat16; falls back to float32 if unsupported |
+| NaN loss in Phase 2 (float16 overflow) | AMP uses bfloat16; falls back to float32 if unsupported |
 | OOM on full-slice validation (V100, 16 GB) | `full_val_every_n_epochs: 999`; `eval.batch_size: 1` |
 | 1-2 missing scan directories | Logged at startup, training continues without them |
 

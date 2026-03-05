@@ -1,108 +1,110 @@
 """
-Model: DenseNet-121 backbone with RadImageNet pretrained weights for COVID-19 CT slice classification.
+Model: DINOv2 ViT-B/14 backbone for COVID-19 CT slice classification.
+
+DINOv2 is a self-supervised vision model (Meta) that learns robust representations
+without labels. ViT-B/14 has 86M params, 768-dim embeddings, 14×14 patch size.
 
 Single model class used for both training phases:
   Phase 1: Frozen backbone, head-only fine-tuning
-  Phase 2: Gradual backbone unfreezing (denseblock4 → denseblock3)
+  Phase 2: Gradual backbone unfreezing (last 2 transformer blocks → last 4 blocks)
 
 Scan-level predictions aggregate per-slice sigmoid probabilities by averaging.
 """
-import os
-
 import torch
 import torch.nn as nn
-from torchvision import models
 
 
-class DenseNetCovidClassifier(nn.Module):
+class DINOv2CovidClassifier(nn.Module):
     """
-    DenseNet-121 for COVID-19 CT slice classification.
+    DINOv2 ViT-B/14 for COVID-19 CT slice classification.
     Binary output: logit > 0 → non-covid (1), logit <= 0 → covid (0).
 
-    DenseNet-121 layer names for unfreezing reference:
-        features.conv0, features.norm0, features.relu0, features.pool0
-        features.denseblock1, features.transition1
-        features.denseblock2, features.transition2
-        features.denseblock3, features.transition3
-        features.denseblock4, features.norm5
-        classifier
+    ViT-B/14 structure for unfreezing:
+        patch_embed, cls_token, pos_embed
+        blocks.0 ... blocks.11  (12 transformer blocks)
+        norm
+        head (our classifier: Dropout + Linear)
     """
 
-    EMBED_DIM = 1024  # DenseNet-121 feature dimension before classifier
+    EMBED_DIM = 768  # ViT-B/14 feature dimension
 
-    def __init__(self, pretrained_path: str = None, dropout: float = 0.4):
+    def __init__(self, dropout: float = 0.4, hub_repo: str = "facebookresearch/dinov2",
+                 hub_model: str = "dinov2_vitb14"):
         super().__init__()
 
-        self.backbone = models.densenet121(weights=None)
+        # Load DINOv2 backbone from torch hub (self-supervised, no labels)
+        self.backbone = torch.hub.load(hub_repo, hub_model, pretrained=True, verbose=False)
 
-        if pretrained_path and os.path.exists(pretrained_path):
-            self._load_radimagenet(pretrained_path)
-        elif pretrained_path:
-            print(f"WARNING: RadImageNet weights not found at {pretrained_path!r}. "
-                  "Training from random init.")
-
-        # Replace classifier: Dropout(0.4) + Linear(1024, 1) — binary classification
-        self.backbone.classifier = nn.Sequential(
+        # Replace head: Dropout + Linear(768, 1) for binary classification
+        self.backbone.head = nn.Sequential(
             nn.Dropout(p=dropout),
             nn.Linear(self.EMBED_DIM, 1),
         )
-        nn.init.kaiming_normal_(self.backbone.classifier[1].weight, mode="fan_out")
-        nn.init.zeros_(self.backbone.classifier[1].bias)
+        nn.init.kaiming_normal_(self.backbone.head[1].weight, mode="fan_out")
+        nn.init.zeros_(self.backbone.head[1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 3, H, W) — individual slices
+            x: (B, 3, H, W) — individual slices (224×224 expected)
         Returns:
             logits: (B, 1) — raw logits (apply sigmoid for probabilities)
         """
+        # DINOv2 forward: returns head(cls_token) — our head gives (B, 1)
         return self.backbone(x)
-
-    def _load_radimagenet(self, path: str) -> None:
-        """
-        Load RadImageNet pretrained weights.  Handles two checkpoint formats:
-          1. Direct state dict — keys start with 'features.' or 'classifier.'
-          2. Full serialised nn.Module — extracts .state_dict() automatically.
-        Classifier keys are always dropped so our new head is used.
-        """
-        obj = torch.load(path, map_location="cpu", weights_only=False)
-
-        if isinstance(obj, dict) and any(
-            k.startswith("features.") or k.startswith("classifier.")
-            for k in obj.keys()
-        ):
-            # Direct state dict
-            sd = {k: v for k, v in obj.items() if not k.startswith("classifier")}
-        else:
-            # Full serialised module
-            src_sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
-            sd = {k: v for k, v in src_sd.items() if not k.startswith("classifier")}
-
-        missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
-        print(f"RadImageNet weights loaded from {path!r}. "
-              f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
     # ------------------------------------------------------------------
     # Layer freezing / unfreezing helpers
     # ------------------------------------------------------------------
 
     def freeze_backbone(self) -> None:
-        """Freeze all backbone parameters; keep classifier trainable."""
+        """Freeze all backbone parameters except the classification head."""
         for name, p in self.backbone.named_parameters():
-            if "classifier" not in name:
+            if "head" not in name:
                 p.requires_grad = False
 
     def unfreeze_block(self, *block_names: str) -> None:
         """
         Unfreeze parameters belonging to any of the specified block names.
 
+        ViT block names: "blocks.11", "blocks.10", "norm", etc.
+        For chunked layouts (block_chunks>1), use "blocks.3.2", "blocks.3.1" for last blocks.
+
         Example:
-            model.unfreeze_block('denseblock4', 'norm5')
-            model.unfreeze_block('denseblock3', 'transition3')
+            model.unfreeze_block("blocks.11", "blocks.10", "norm")
+            model.unfreeze_block("blocks.9", "blocks.8")
         """
         for name, p in self.backbone.named_parameters():
             if any(b in name for b in block_names):
                 p.requires_grad = True
+
+    def unfreeze_blocks_by_index(self, indices: list, also_norm: bool = False) -> None:
+        """
+        Unfreeze transformer blocks by 0-based index (0-11 for ViT-B).
+        Handles both flat (blocks.0..blocks.11) and chunked layouts.
+        """
+        for name, p in self.backbone.named_parameters():
+            if "head" in name:
+                continue
+            if also_norm and "norm" in name and "norm1" not in name and "norm2" not in name:
+                p.requires_grad = True
+                continue
+            if "blocks." not in name:
+                continue
+            parts = name.split(".")
+            try:
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    # Chunked: blocks.3.2 → block_idx = 3*3+2 = 11
+                    chunk, inner = int(parts[1]), int(parts[2])
+                    block_idx = chunk * 3 + inner
+                elif len(parts) >= 2 and parts[1].isdigit():
+                    block_idx = int(parts[1])
+                else:
+                    continue
+                if block_idx in indices:
+                    p.requires_grad = True
+            except (ValueError, IndexError):
+                pass
 
     def get_parameter_groups(self, head_lr: float, block_lrs: dict) -> list:
         """
@@ -111,18 +113,18 @@ class DenseNetCovidClassifier(nn.Module):
         Args:
             head_lr:   Learning rate for the classifier head.
             block_lrs: Dict mapping block name fragment → lr.
-                       e.g. {'denseblock4': 1e-4, 'norm5': 1e-4, 'denseblock3': 5e-5}
+                       e.g. {"blocks.11": 1e-4, "blocks.10": 1e-4, "norm": 1e-4}
 
         Returns:
-            List of {'params': [...], 'lr': lr} dicts suitable for AdamW.
+            List of {"params": [...], "lr": lr} dicts suitable for AdamW.
         """
-        assigned: set = set()
+        assigned = set()
         groups = []
 
         # Classifier head
         head_params = [
             p for n, p in self.backbone.named_parameters()
-            if "classifier" in n and p.requires_grad
+            if "head" in n and p.requires_grad
         ]
         if head_params:
             groups.append({"params": head_params, "lr": head_lr})
@@ -130,9 +132,14 @@ class DenseNetCovidClassifier(nn.Module):
 
         # Named backbone blocks (order matters: more specific first)
         for block_name, lr in block_lrs.items():
+            def _match_block(n: str) -> bool:
+                if block_name == "norm":
+                    return "norm" in n and "blocks." not in n  # top-level norm only
+                return block_name in n
+
             block_params = [
                 p for n, p in self.backbone.named_parameters()
-                if block_name in n and p.requires_grad and id(p) not in assigned
+                if _match_block(n) and p.requires_grad and id(p) not in assigned
             ]
             if block_params:
                 groups.append({"params": block_params, "lr": lr})
