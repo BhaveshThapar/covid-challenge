@@ -38,9 +38,9 @@ covid-challenge/
 ## Setup (on Nexus cluster)
 
 ```bash
-# 1. Clone the aadit-dev branch
-cd /fs/nexus-scratch/aadit
-git clone -b aadit-dev https://github.com/BhaveshThapar/covid-challenge.git covid-challenge
+# 1. Clone the Anant-dev branch
+cd /fs/nexus-scratch/anant04
+git clone -b Anant-dev https://github.com/BhaveshThapar/covid-challenge.git covid-challenge
 cd covid-challenge
 
 # 2. Create environment
@@ -92,7 +92,7 @@ BASH_ENV=/usr/share/Modules/init/bash sbatch \
   --partition=tron --account=nexus --qos=medium \
   --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=10:00:00 \
   --output=logs/phase2_%j.out --error=logs/phase2_%j.err \
-  --wrap='cd /fs/nexus-scratch/aadit/covid-challenge &&
+  --wrap='cd /fs/nexus-scratch/anant04/covid-challenge &&
           source /usr/share/Modules/init/bash &&
           module load Python3/3.10.14 &&
           source venv/bin/activate &&
@@ -183,7 +183,7 @@ Flags:
 git add -p && git commit -m "..." && git push
 
 # Nexus: pull latest
-cd /fs/nexus-scratch/aadit/covid-challenge
+cd /fs/nexus-scratch/anant04/covid-challenge
 git pull
 sbatch slurm/train.sbatch
 ```
