@@ -234,8 +234,9 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
 
         if f1_dict["average"] > best_f1:
             best_f1 = f1_dict["average"]
-            ckpt_mgr.save_named(model, optimizer, epoch, best_f1, "phase1_best.pt")
-            logger.info(f"  → New best F1: {best_f1:.4f} (saved phase1_best.pt)")
+            p1_ckpt = f"{config['run_name']}_phase1_best.pt"
+            ckpt_mgr.save_named(model, optimizer, epoch, best_f1, p1_ckpt)
+            logger.info(f"  → New best F1: {best_f1:.4f} (saved {p1_ckpt})")
 
         if early_stop(f1_dict["average"]):
             logger.info(f"Early stopping at epoch {epoch}")
@@ -246,7 +247,8 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
 
     # Reload best weights before returning
     CheckpointManager.load(
-        os.path.join(config["checkpoint_dir"], "phase1_best.pt"), model, device=device
+        os.path.join(config["checkpoint_dir"], f"{config['run_name']}_phase1_best.pt"),
+        model, device=device
     )
     return model
 
@@ -341,7 +343,7 @@ def train_phase2(
 
     # Load Phase 1 checkpoint if model not passed in
     if phase1_model is None:
-        phase1_path = os.path.join(config["checkpoint_dir"], "phase1_best.pt")
+        phase1_path = os.path.join(config["checkpoint_dir"], f"{config['run_name']}_phase1_best.pt")
         model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
         CheckpointManager.load(phase1_path, model, device=device)
         logger.info(f"Loaded Phase 1 checkpoint from {phase1_path}")
@@ -357,6 +359,8 @@ def train_phase2(
     logger.info("Sub-phase 2a: Unfreezing denseblock4 + norm5")
     model.unfreeze_block("denseblock4", "norm5")
 
+    rn = config["run_name"]
+
     f1_2a, ep_offset = _run_subphase(
         model=model,
         train_loader=train_loader,
@@ -370,7 +374,7 @@ def train_phase2(
         head_lr=p2["head_lr"],
         block_lrs={"denseblock4": p2["block4_lr"], "norm5": p2["block4_lr"]},
         n_epochs=p2["block4_epochs"],
-        save_name="phase2a",
+        save_name=f"{rn}_phase2a",
         epoch_offset=0,
     )
     overall_best_f1 = max(overall_best_f1, f1_2a)
@@ -380,7 +384,7 @@ def train_phase2(
 
     # Reload best from 2a to start 2b from a clean state
     CheckpointManager.load(
-        os.path.join(config["checkpoint_dir"], "phase2a_best.pt"), model, device=device
+        os.path.join(config["checkpoint_dir"], f"{rn}_phase2a_best.pt"), model, device=device
     )
     model.unfreeze_block("denseblock3", "transition3")
 
@@ -400,18 +404,18 @@ def train_phase2(
             "denseblock3": p2["block3_lr"], "transition3": p2["block3_lr"],
         },
         n_epochs=p2["block3_epochs"],
-        save_name="phase2b",
+        save_name=f"{rn}_phase2b",
         epoch_offset=ep_offset,
     )
     overall_best_f1 = max(overall_best_f1, f1_2b)
 
-    # Copy the globally best checkpoint to best.pt
-    best_sub = "phase2b" if f1_2b >= f1_2a else "phase2a"
+    # Copy the globally best checkpoint to {run_name}_ovr_best.pt
+    best_sub = f"{rn}_phase2b" if f1_2b >= f1_2a else f"{rn}_phase2a"
     best_src = os.path.join(config["checkpoint_dir"], f"{best_sub}_best.pt")
-    best_dst = os.path.join(config["checkpoint_dir"], "best.pt")
+    best_dst = os.path.join(config["checkpoint_dir"], f"{rn}_ovr_best.pt")
     import shutil
     shutil.copy2(best_src, best_dst)
-    logger.info(f"Best overall F1: {overall_best_f1:.4f} (from {best_sub}) → saved as best.pt")
+    logger.info(f"Best overall F1: {overall_best_f1:.4f} (from {best_sub}) → saved as {rn}_ovr_best.pt")
 
     writer.close()
     CheckpointManager.load(best_dst, model, device=device)
@@ -429,6 +433,8 @@ def main():
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
     parser.add_argument("--phase", type=int, choices=[1, 2, 0], default=0,
                         help="Phase to run: 1=head-only, 2=gradual unfreeze, 0=both")
+    parser.add_argument("--run-name", type=str, default="run",
+                        help="Prefix for checkpoint filenames, e.g. 'v1' → v1_phase1_best.pt, v1_ovr_best.pt")
     parser.add_argument("--radimagenet-weights", type=str, default=None,
                         help="Path to RadImageNet DenseNet-121 checkpoint (overrides config)")
     parser.add_argument("--overfit-batches", type=int, default=0,
@@ -440,6 +446,8 @@ def main():
     config["log_dir"] = config.get("log_dir", "logs")
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["log_dir"], exist_ok=True)
+
+    config["run_name"] = args.run_name
 
     # CLI override for RadImageNet weights path
     if args.radimagenet_weights:
