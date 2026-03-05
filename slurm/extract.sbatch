@@ -11,6 +11,10 @@
 set -e
 cd /fs/nexus-scratch/anant04/covid-challenge
 
+# Use scratch as HOME so gdown writes to scratch (home dir is full)
+export HOME=/fs/nexus-scratch/anant04
+mkdir -p "$HOME/.cache/gdown"
+
 # Load environment
 module load Python3/3.10.14
 module load unrar/7.0.9
