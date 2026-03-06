@@ -91,7 +91,7 @@ datasets/               # metadata CSVs live here (alongside raw archives)
 
 ## Data Sampling
 
-**Training (scan-level MIL):** `ScanDataset` is used for training — each dataset item is a full scan. 64 slices are sampled uniformly per scan; after preprocessing (ROI crop → 224×224), they are stacked into a `(K=64, 3, H, W)` bag. `CenterBatchSampler` operates at the scan level, assembling batches of 8 scans with balanced hospital center representation. `scan_collate_fn` pads bags to a fixed K and produces a boolean mask so the attention layer ignores padded positions. Each scan's bag is forwarded as `(B=8, K=64, 3, H, W)` and the model's attention pooling collapses K slices into a single scan embedding internally.
+**Training (scan-level MIL):** `ScanDataset` is used for training — each dataset item is a full scan. 64 slices are sampled uniformly per scan; after preprocessing (ROI crop → 224×224), they are stacked into a `(K=64, 3, H, W)` bag. `CenterBatchSampler` assembles batches of 8 scans with **center-and-class balance**: 2 scans per center × 1 COVID + 1 Non-COVID per center, so every batch has exactly equal center and class representation. If a (center, class) bucket runs out, it is resampled with replacement; the epoch ends when the largest bucket is exhausted. `scan_collate_fn` pads bags to a fixed K and produces a boolean mask so the attention layer ignores padded positions. Each scan's bag is forwarded as `(B=8, K=64, 3, H, W)` and the model's attention pooling collapses K slices into a single scan embedding internally.
 
 **Validation (scan-level MIL):** 48 slices are sampled per scan. The same MIL forward pass is used — attention pooling produces one logit per scan directly, with no post-hoc averaging needed. Batch size = 1 scan.
 

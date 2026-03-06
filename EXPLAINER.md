@@ -50,7 +50,7 @@ Think of it as **a doctor who studies a whole patient chart at once, paying more
 
 ## How Data Is Sampled
 
-**During training (scan-level MIL):** Each dataset item is a whole scan. 64 slices are sampled uniformly from the scan, preprocessed with the ROI crop, and stacked into a bag of shape `(64, 3, 224, 224)`. Batches of 8 scans are assembled using `CenterBatchSampler` at the scan level, ensuring representation from all 4 hospitals in every batch. A boolean mask is produced so the model's attention layer can ignore any padding positions.
+**During training (scan-level MIL):** Each dataset item is a whole scan. 64 slices are sampled uniformly from the scan, preprocessed with the ROI crop, and stacked into a bag of shape `(64, 3, 224, 224)`. Batches of 8 scans are assembled using `CenterBatchSampler` with **center-and-class balance**: each batch contains exactly 2 scans per hospital — 1 COVID + 1 Non-COVID — giving equal center and class representation in every gradient step. If a center×class bucket (e.g. source_2 COVID) runs out, it is resampled with replacement; the epoch ends when the largest bucket is exhausted. A boolean mask is produced so the model's attention layer can ignore any padding positions.
 
 **During validation (scan-level MIL):** 48 slices per scan, same ROI crop and MIL forward — the model directly outputs one scan-level logit via attention pooling. No post-hoc averaging is needed.
 

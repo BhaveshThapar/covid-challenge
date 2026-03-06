@@ -397,48 +397,93 @@ def scan_collate_fn(batch):
 
 class CenterBatchSampler(Sampler):
     """
-    Yields batches where each medical center (0-3) contributes roughly equally.
-    Smaller centers are resampled with replacement to match the largest center's
-    pool size each epoch — no data from any center is permanently discarded.
+    Center-and-class-balanced batch sampler for scan-level MIL training.
 
-    Usage:
-        sources = [s[2] for s in train_ds.samples]
-        DataLoader(train_ds, batch_sampler=CenterBatchSampler(sources, batch_size=32))
+    Each batch of B scans is structured as:
+        (B // n_centers) scans per center, split evenly between COVID and Non-COVID.
+
+    For B=8, n_centers=4: each center contributes exactly 2 scans per batch —
+    1 COVID and 1 Non-COVID — so every batch has equal center AND class balance.
+
+    Buckets: one per (center, class) pair.  If a bucket runs out before the epoch
+    ends, it is resampled with replacement from itself.  An epoch ends when the
+    largest bucket has been fully iterated once.
+
+    Interaction with asymmetric loss weights: the sampler gives every center equal
+    batch representation; the loss weights (e.g. center_2=0.2) then control how
+    much each center's gradients count.  Both are needed.
+
+    Args:
+        sources: list of center IDs aligned with dataset indices.
+        labels:  list of class labels (0=covid, 1=non-covid), same alignment.
+        batch_size: total scans per batch (must be divisible by n_centers).
     """
 
-    def __init__(self, sources: list, batch_size: int):
-        self.pools_original: dict = defaultdict(list)
-        for i, s in enumerate(sources):
-            self.pools_original[s].append(i)
+    def __init__(self, sources: list, labels: list, batch_size: int):
+        # Build (center, class) → [dataset indices]
+        self.buckets: dict = defaultdict(list)
+        for i, (s, lbl) in enumerate(zip(sources, labels)):
+            self.buckets[(int(s), int(lbl))].append(i)
+
         self.batch_size = batch_size
-        self.n_centers = len(self.pools_original)
-        self.max_size = max(len(v) for v in self.pools_original.values())
+        self.centers = sorted({int(s) for s in sources})
+        self.n_centers = len(self.centers)
+        self.classes = sorted({int(lbl) for lbl in labels})
+        self.n_classes = len(self.classes)
+
+        # Epoch length = largest single bucket, rounded down to full batches
+        # (per-center slots per batch = batch_size // n_centers;
+        #  per-bucket slots = that // n_classes)
+        self.per_center = max(1, batch_size // self.n_centers)
+        self.per_bucket = max(1, self.per_center // self.n_classes)
+        self.max_bucket_size = max(len(v) for v in self.buckets.values())
+
+        missing = []
+        for c in self.centers:
+            for lbl in self.classes:
+                if (c, lbl) not in self.buckets:
+                    missing.append(f"center={c} class={lbl}")
+        if missing:
+            print(f"WARNING CenterBatchSampler: empty buckets {missing} — "
+                  "these slots will be filled by resampling sibling buckets.")
+
+    def _make_pool(self, key) -> list:
+        """Return a shuffled copy of a bucket, extended to max_bucket_size with replacement."""
+        idxs = self.buckets.get(key, [])
+        if not idxs:
+            # Fallback: pull from same center, any class
+            center = key[0]
+            idxs = []
+            for lbl in self.classes:
+                idxs.extend(self.buckets.get((center, lbl), []))
+            if not idxs:
+                idxs = list(range(len(self.centers)))  # last resort
+        pool = list(idxs)
+        random.shuffle(pool)
+        while len(pool) < self.max_bucket_size:
+            extra = list(idxs)
+            random.shuffle(extra)
+            pool.extend(extra)
+        return pool[:self.max_bucket_size]
 
     def __iter__(self):
-        # Oversample smaller centers (with replacement) to match largest
-        pools = {}
-        for c, idxs in self.pools_original.items():
-            shuffled = list(idxs)
-            random.shuffle(shuffled)
-            while len(shuffled) < self.max_size:
-                extra = list(idxs)
-                random.shuffle(extra)
-                shuffled.extend(extra)
-            pools[c] = shuffled[:self.max_size]
+        pools = {key: self._make_pool(key) for key in [
+            (c, lbl) for c in self.centers for lbl in self.classes
+        ]}
+        pos = {key: 0 for key in pools}
 
-        per_center = max(1, self.batch_size // self.n_centers)
-        pos = {c: 0 for c in pools}
-        while all(pos[c] + per_center <= self.max_size for c in pools):
+        while all(pos[key] + self.per_bucket <= self.max_bucket_size for key in pools):
             batch = []
-            for c in sorted(pools):
-                batch.extend(pools[c][pos[c]: pos[c] + per_center])
-                pos[c] += per_center
+            for c in self.centers:
+                for lbl in self.classes:
+                    key = (c, lbl)
+                    batch.extend(pools[key][pos[key]: pos[key] + self.per_bucket])
+                    pos[key] += self.per_bucket
             random.shuffle(batch)
             yield batch
 
     def __len__(self):
-        per_center = max(1, self.batch_size // self.n_centers)
-        return self.max_size // per_center
+        return self.max_bucket_size // self.per_bucket
 
 
 # ---------- DataLoader Builders ---------- #
@@ -460,7 +505,8 @@ def build_slice_dataloaders(data_dir: str, metadata_dir: str, config: dict):
     train_ds = SliceDataset(train_entries, get_train_transforms(img_size), max_slices)
 
     sources = [s[2] for s in train_ds.samples]
-    batch_sampler = CenterBatchSampler(sources, config["phase1"]["batch_size"])
+    labels  = [s[1] for s in train_ds.samples]
+    batch_sampler = CenterBatchSampler(sources, labels, config["phase1"]["batch_size"])
 
     train_loader = DataLoader(
         train_ds,
@@ -491,9 +537,10 @@ def build_scan_train_dataloader(data_dir: str, metadata_dir: str, config: dict):
         slices_per_scan=config["data"]["slices_per_scan"],   # K=64
     )
 
-    # CenterBatchSampler accepts any source list — reuse at scan level
-    scan_sources  = [entry["source"] for entry in train_entries]
-    batch_sampler = CenterBatchSampler(scan_sources, config["phase1"]["batch_size"])
+    # Center-and-class-balanced sampler at scan level
+    scan_sources = [entry["source"] for entry in train_entries]
+    scan_labels  = [entry["label"]  for entry in train_entries]
+    batch_sampler = CenterBatchSampler(scan_sources, scan_labels, config["phase1"]["batch_size"])
 
     train_loader = DataLoader(
         train_ds,
