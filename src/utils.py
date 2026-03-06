@@ -46,18 +46,21 @@ def compute_macro_f1(y_true, y_pred):
     return f1_score(y_true, y_pred, average="macro", zero_division=0)
 
 
-def compute_per_source_f1(y_true, y_pred, sources, strict_labels=True):
+def compute_per_source_f1(y_true, y_pred, sources, exclude_missing_classes=True):
     """
-    Compute macro F1 per data source, then average.
+    Compute macro F1 per data source, then average across sources.
+
+    Per challenge rules: when a source contains no samples for one class,
+    that class is excluded from the macro average for that source.
+    E.g. if Source 2 has only non-covid samples, macro F1 = F1 of non-covid only.
 
     Args:
-        y_true: array of true labels (0=covid, 1=non-covid or vice versa)
+        y_true: array of true labels (0=covid, 1=non-covid)
         y_pred: array of predicted labels
         sources: array of source IDs (0-3)
-        strict_labels: if True, always compute F1 for both class 0 and class 1,
-                       matching the challenge formula (F1_covid + F1_noncovid) / 2.
-                       If False, uses sklearn default (only classes present in
-                       y_true ∪ y_pred) — used during training for early stopping.
+        exclude_missing_classes: if True (default), compute macro F1 only over
+            classes present in y_true for that source (challenge-compliant).
+            If False, use labels=[0, 1] so missing classes contribute 0.
 
     Returns:
         dict with per-source F1 and the averaged final score
@@ -72,10 +75,13 @@ def compute_per_source_f1(y_true, y_pred, sources, strict_labels=True):
         mask = sources == src
         if mask.sum() == 0:
             continue
-        if strict_labels:
-            f1 = f1_score(y_true[mask], y_pred[mask], average="macro", zero_division=0, labels=[0, 1])
+        y_src = y_true[mask]
+        p_src = y_pred[mask]
+        if exclude_missing_classes:
+            labels_present = np.unique(y_src)
+            f1 = f1_score(y_src, p_src, average="macro", zero_division=0, labels=labels_present)
         else:
-            f1 = f1_score(y_true[mask], y_pred[mask], average="macro", zero_division=0)
+            f1 = f1_score(y_src, p_src, average="macro", zero_division=0, labels=[0, 1])
         source_f1[f"source_{src}"] = f1
 
     avg_f1 = np.mean(list(source_f1.values())) if source_f1 else 0.0
