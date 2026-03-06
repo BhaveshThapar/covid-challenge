@@ -29,11 +29,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.model import CovidDetector
 from src.dataset import build_scan_manifest, ScanDataset, get_val_transforms, scan_collate_fn
 from src.utils import load_config, set_seed, compute_per_source_f1, print_confusion_matrices, CheckpointManager
-from src.evaluate import sweep_threshold
+from src.evaluate import sweep_threshold, sweep_threshold_per_source
 
 
 def load_model(config, checkpoint_path, device):
-    """Load a trained model from config + checkpoint."""
+    """Load a trained Phase 2 (CovidDetector) model from config + checkpoint."""
+    # Pre-check: detect Phase 1 (SliceClassifier) checkpoints
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    ckpt_keys = set(ckpt.get("model_state_dict", {}).keys())
+    has_attention = any("attention" in k for k in ckpt_keys)
+    has_head = any(k.startswith("head.") for k in ckpt_keys)
+    if has_head and not has_attention:
+        raise ValueError(
+            f"Checkpoint '{checkpoint_path}' is a Phase 1 (SliceClassifier) model, "
+            f"not a Phase 2 (CovidDetector) model. You need to train Phase 2 first.\n"
+            f"  Run: sbatch --export=CONFIG={config.get('_config_path', '?')} slurm/train.sbatch"
+        )
+
     model = CovidDetector(
         backbone_name=config["model"]["backbone"],
         pretrained=False,
@@ -51,8 +63,14 @@ def load_model(config, checkpoint_path, device):
     return model, score
 
 
-def evaluate_single(model, val_loader, device, use_tta=True):
+def evaluate_single(model, val_loader, device, tta_mode="hflip"):
     """Evaluate a single model, returning softmax probabilities."""
+    # Backward compat
+    if tta_mode is True:
+        tta_mode = "hflip"
+    elif tta_mode is False:
+        tta_mode = "none"
+
     model.eval()
     all_probs, all_labels, all_sources = [], [], []
 
@@ -64,10 +82,18 @@ def evaluate_single(model, val_loader, device, use_tta=True):
             with autocast(enabled=True):
                 logits, _ = model(images, masks)
 
-                if use_tta:
-                    images_flip = torch.flip(images, dims=[-1])
-                    logits_flip, _ = model(images_flip, masks)
-                    logits = (logits + logits_flip) / 2.0
+                if tta_mode == "hflip":
+                    logits_hflip, _ = model(torch.flip(images, dims=[-1]), masks)
+                    logits = (logits + logits_hflip) / 2.0
+                elif tta_mode == "multi":
+                    tta_logits = [logits]
+                    logits_hflip, _ = model(torch.flip(images, dims=[-1]), masks)
+                    tta_logits.append(logits_hflip)
+                    logits_vflip, _ = model(torch.flip(images, dims=[-2]), masks)
+                    tta_logits.append(logits_vflip)
+                    logits_hvflip, _ = model(torch.flip(images, dims=[-2, -1]), masks)
+                    tta_logits.append(logits_hvflip)
+                    logits = torch.stack(tta_logits).mean(dim=0)
 
             probs = F.softmax(logits, dim=1).cpu().numpy()
             all_probs.extend(probs)
@@ -121,7 +147,7 @@ def main():
         "Must have same number of configs and checkpoints"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_tta = not args.no_tta
+    tta_mode = "none" if args.no_tta else "multi"
 
     # Load all models
     print("=" * 60)
@@ -165,7 +191,7 @@ def main():
     for i, (model, config) in enumerate(zip(models, configs)):
         print(f"\nModel {i+1}: {config['model']['backbone']} (seed={config['seed']})")
         probs, labels_i, sources_i = evaluate_single(
-            model, val_loader, device, use_tta=use_tta)
+            model, val_loader, device, tta_mode=tta_mode)
         all_model_probs.append(probs)
 
         if labels is None:
@@ -224,13 +250,38 @@ def main():
         marker = "  ★" if k_name == "average" else ""
         print(f"  {k_name:>12}: {v:.4f}{marker}")
 
+    best_overall_f1 = f1_sweep["average"]
+    final_preds = best_preds
+    final_f1_dict = f1_sweep
+
+    # Per-source threshold sweep
+    print("\n" + "=" * 60)
+    print("ENSEMBLE + PER-SOURCE THRESHOLD SWEEP")
+    print("=" * 60)
+
+    ps_f1, ps_thresholds, ps_preds = sweep_threshold_per_source(ens_probs, labels, sources)
+    f1_ps = compute_per_source_f1(labels, ps_preds, sources)
+    for src, t in sorted(ps_thresholds.items()):
+        print(f"  {src}: t={t:.3f}")
+    for k_name, v in sorted(f1_ps.items()):
+        marker = "  ★" if k_name == "average" else ""
+        print(f"  {k_name:>12}: {v:.4f}{marker}")
+
+    if ps_f1 > best_overall_f1:
+        best_overall_f1 = ps_f1
+        final_preds = ps_preds
+        final_f1_dict = f1_ps
+        print(f"\n  → Per-source thresholds are best")
+    else:
+        print(f"\n  → Global threshold is best")
+
     # Confusion matrices
-    print_confusion_matrices(labels, best_preds, sources)
+    print_confusion_matrices(labels, final_preds, sources)
 
     # Summary
-    acc = (best_preds == labels).mean()
+    acc = (final_preds == labels).mean()
     print(f"\nOverall accuracy: {acc:.4f}")
-    print(f"Final Challenge Score (P): {f1_sweep['average']:.4f}")
+    print(f"Final Challenge Score (P): {final_f1_dict['average']:.4f}")
 
 
 if __name__ == "__main__":

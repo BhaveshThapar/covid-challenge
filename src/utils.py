@@ -42,16 +42,21 @@ def get_logger(name: str, log_file: str = None) -> logging.Logger:
 
 
 def compute_macro_f1(y_true, y_pred):
-    """Compute macro F1 (average of per-class F1)."""
-    return f1_score(y_true, y_pred, average="macro", zero_division=0)
+    """Compute macro F1 (average of per-class F1), excluding classes not in y_true."""
+    present_labels = np.unique(y_true)
+    return f1_score(y_true, y_pred, average="macro", labels=present_labels, zero_division=0)
 
 
 def compute_per_source_f1(y_true, y_pred, sources):
     """
     Compute macro F1 per data source, then average.
     
+    Per competition organizer clarification: when a source contains no samples
+    for a class, that class's F1 is EXCLUDED from the macro-average (not set to 0).
+    E.g., if Centre 2 has no COVID samples, its score = F1_noncovid only.
+    
     Args:
-        y_true: array of true labels (0=covid, 1=non-covid or vice versa)
+        y_true: array of true labels (0=covid, 1=non-covid)
         y_pred: array of predicted labels
         sources: array of source IDs (0-3)
     
@@ -68,7 +73,10 @@ def compute_per_source_f1(y_true, y_pred, sources):
         mask = sources == src
         if mask.sum() == 0:
             continue
-        f1 = f1_score(y_true[mask], y_pred[mask], average="macro", zero_division=0)
+        # Only compute F1 for classes present in ground truth for this source
+        present_labels = np.unique(y_true[mask])
+        f1 = f1_score(y_true[mask], y_pred[mask], average="macro",
+                      labels=present_labels, zero_division=0)
         source_f1[f"source_{src}"] = f1
 
     avg_f1 = np.mean(list(source_f1.values())) if source_f1 else 0.0

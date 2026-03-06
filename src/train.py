@@ -10,6 +10,8 @@ Improvements over baseline:
   - Step-level linear warmup + cosine decay scheduler
   - Embedding-level mixup in Phase 2
   - drop_path_rate for stochastic depth
+  - Stochastic Weight Averaging (SWA) for flatter minima
+  - Per-source loss weighting for balanced cross-centre performance
 """
 import os
 import sys
@@ -23,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -252,6 +255,9 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
     freeze_backbone_epochs = config["phase2"].get("freeze_backbone_epochs", 0)
     mixup_alpha = config["phase2"].get("mixup_alpha", 0.0)
     backbone_lr_factor = config["phase2"].get("backbone_lr_factor", 0.1)
+    swa_start_epoch = config["phase2"].get("swa_start_epoch", 0)
+    swa_lr = config["phase2"].get("swa_lr", 1e-5)
+    source_loss_weights = config["phase2"].get("source_loss_weights", None)
 
     # Initially freeze backbone if configured
     backbone_frozen = False
@@ -335,6 +341,13 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
                     logits, attn = model(images, masks)
                     loss = criterion(logits, labels)
 
+                # Apply per-source loss weighting if configured
+                if source_loss_weights is not None:
+                    src_weights = torch.tensor(source_loss_weights, device=device, dtype=torch.float32)
+                    # Per-sample weight based on source
+                    sample_weights = src_weights[sources.to(device)].mean()
+                    loss = loss * sample_weights
+
                 loss = loss / grad_accum
 
             scaler.scale(loss).backward()
@@ -404,6 +417,91 @@ def train_phase2(config, data_dir, metadata_dir, device, logger, slice_model=Non
             break
 
     writer.close()
+
+    # ---- SWA phase (optional) ----
+    if swa_start_epoch > 0:
+        logger.info("=" * 40)
+        logger.info("SWA: Stochastic Weight Averaging")
+        logger.info("=" * 40)
+
+        # Load best checkpoint as starting point for SWA
+        best_ckpt_path = os.path.join(config["checkpoint_dir"], "best.pt")
+        if os.path.exists(best_ckpt_path):
+            CheckpointManager.load(best_ckpt_path, model, device=device)
+            logger.info(f"Loaded best checkpoint for SWA base")
+
+        swa_model = AveragedModel(model)
+        swa_scheduler = SWALR(optimizer, swa_lr=swa_lr)
+        swa_epochs = 5  # Run SWA for 5 additional epochs
+
+        for swa_epoch in range(1, swa_epochs + 1):
+            model.train()
+            pbar = tqdm(train_loader, desc=f"SWA Epoch {swa_epoch}/{swa_epochs}")
+            for step, (images, labels, sources, masks) in enumerate(pbar):
+                images = images.to(device)
+                labels = labels.to(device)
+                masks = masks.to(device)
+
+                with autocast(enabled=use_amp):
+                    logits, attn = model(images, masks)
+                    loss = criterion(logits, labels)
+                    loss = loss / grad_accum
+
+                scaler.scale(loss).backward()
+
+                if (step + 1) % grad_accum == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
+                pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}")
+
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+            logger.info(f"SWA epoch {swa_epoch} complete")
+
+        # Update BN statistics for SWA model
+        logger.info("Updating BatchNorm statistics for SWA model...")
+        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
+
+        # Save SWA model
+        swa_path = os.path.join(config["checkpoint_dir"], "swa_best.pt")
+        torch.save({
+            "epoch": -1,
+            "model_state_dict": swa_model.module.state_dict(),
+            "score": best_f1,
+        }, swa_path)
+        logger.info(f"Saved SWA model to {swa_path}")
+
+        # Evaluate SWA model
+        swa_model.eval()
+        all_preds, all_labels_eval, all_sources_eval = [], [], []
+        with torch.no_grad():
+            for images, labels_batch, sources_batch, masks in val_loader:
+                images = images.to(device)
+                masks = masks.to(device)
+                with autocast(enabled=use_amp):
+                    logits, _ = swa_model(images, masks)
+                preds = logits.argmax(dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels_eval.extend(labels_batch.numpy())
+                all_sources_eval.extend(sources_batch.numpy())
+
+        f1_dict = compute_per_source_f1(all_labels_eval, all_preds, all_sources_eval)
+        logger.info(f"SWA: avg_F1={f1_dict['average']:.4f}, per_source={f1_dict}")
+
+        if f1_dict["average"] > best_f1:
+            # Overwrite best.pt with SWA model
+            torch.save({
+                "epoch": -1,
+                "model_state_dict": swa_model.module.state_dict(),
+                "score": f1_dict["average"],
+            }, best_ckpt_path)
+            logger.info(f"SWA model is better! Saved as best.pt (F1={f1_dict['average']:.4f})")
+            best_f1 = f1_dict["average"]
+        else:
+            logger.info(f"SWA model not better than best ({best_f1:.4f}), keeping original")
+
     logger.info(f"Phase 2 complete. Best F1: {best_f1:.4f}")
     return model
 

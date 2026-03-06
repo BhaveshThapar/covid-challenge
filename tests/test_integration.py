@@ -364,6 +364,119 @@ def test_checkpoint_save_load():
     shutil.rmtree(tmpdir)
 
 
+# ========== TEST 10: Per-Source Threshold Sweep ==========
+
+def test_per_source_threshold_sweep():
+    """Verify per-source sweep finds independent thresholds."""
+    from src.evaluate import sweep_threshold_per_source
+    np.random.seed(42)
+    probs = np.random.rand(200, 2)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    labels = np.random.randint(0, 2, 200)
+    sources = np.array([0]*50 + [1]*50 + [2]*50 + [3]*50)
+    ps_f1, ps_thresholds, preds = sweep_threshold_per_source(probs, labels, sources)
+    # Should have a threshold per source
+    assert len(ps_thresholds) == 4, f"Expected 4 thresholds, got {len(ps_thresholds)}"
+    # Each threshold should be in valid range
+    for src, t in ps_thresholds.items():
+        assert 0.2 <= t <= 0.8, f"Threshold out of range for {src}: {t}"
+    assert 0 <= ps_f1 <= 1.0
+
+
+def test_per_source_vs_global_threshold():
+    """Per-source thresholds should be >= global threshold in F1."""
+    from src.evaluate import sweep_threshold_per_source, sweep_threshold
+    np.random.seed(123)
+    probs = np.random.rand(200, 2)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    labels = np.random.randint(0, 2, 200)
+    sources = np.array([0]*50 + [1]*50 + [2]*50 + [3]*50)
+    global_f1, _, _ = sweep_threshold(probs, labels, sources)
+    ps_f1, _, _ = sweep_threshold_per_source(probs, labels, sources)
+    assert ps_f1 >= global_f1 - 0.01, \
+        f"Per-source F1 ({ps_f1:.4f}) should be >= global F1 ({global_f1:.4f})"
+
+
+# ========== TEST 11: Enhanced TTA ==========
+
+def test_multi_flip_tta():
+    """Verify multi-flip TTA mode produces valid probabilities."""
+    # Use a tiny model for speed
+    model = CovidDetector(classifier_hidden_dim=512, drop_path_rate=0.0)
+    model.eval()
+    x = torch.randn(1, 4, 3, 224, 224)
+    mask = torch.ones(1, 4)
+
+    # Test that multi-flip produces different logits than no-TTA
+    with torch.no_grad():
+        logits_plain, _ = model(x, mask)
+        # Simulate multi-flip
+        tta_logits = [logits_plain]
+        logits_hflip, _ = model(torch.flip(x, dims=[-1]), mask)
+        tta_logits.append(logits_hflip)
+        logits_vflip, _ = model(torch.flip(x, dims=[-2]), mask)
+        tta_logits.append(logits_vflip)
+        logits_hvflip, _ = model(torch.flip(x, dims=[-2, -1]), mask)
+        tta_logits.append(logits_hvflip)
+        logits_multi = torch.stack(tta_logits).mean(dim=0)
+
+    probs = F.softmax(logits_multi, dim=1)
+    assert torch.allclose(probs.sum(dim=1), torch.ones(1), atol=1e-5), \
+        "Multi-flip TTA probabilities don't sum to 1"
+    assert not torch.equal(logits_plain, logits_multi), \
+        "Multi-flip TTA should produce different logits than plain"
+
+
+# ========== TEST 12: EfficientNetV2-S ==========
+
+def test_effv2_model():
+    """Verify EfficientNetV2-S backbone works end-to-end."""
+    model = CovidDetector(backbone_name="tf_efficientnetv2_s",
+                          classifier_hidden_dim=512, drop_path_rate=0.3)
+    model.eval()
+    x = torch.randn(1, 4, 3, 256, 256)
+    mask = torch.ones(1, 4)
+    with torch.no_grad():
+        logits, attn = model(x, mask)
+    assert logits.shape == (1, 2), f"Bad logits shape: {logits.shape}"
+    assert model.embed_dim == 1280, f"Bad embed dim: {model.embed_dim}"
+
+
+# ========== TEST 13: SWA Model Creation ==========
+
+def test_swa_model():
+    """Verify SWA averaged model can be created and used."""
+    from torch.optim.swa_utils import AveragedModel
+    model = CovidDetector(classifier_hidden_dim=512, drop_path_rate=0.0)
+    swa_model = AveragedModel(model)
+    x = torch.randn(1, 4, 3, 224, 224)
+    mask = torch.ones(1, 4)
+    model.eval()
+    swa_model.eval()
+    with torch.no_grad():
+        logits_orig, _ = model(x, mask)
+        logits_swa, _ = swa_model(x, mask)
+    # After 1 update, SWA should match the original
+    assert logits_orig.shape == logits_swa.shape, "SWA model shape mismatch"
+    assert not torch.isnan(logits_swa).any(), "SWA model produced NaN"
+
+
+# ========== TEST 14: Config Loading (new configs) ==========
+
+def test_new_configs():
+    """Verify new config files load correctly."""
+    cfg1 = load_config("configs/exp_effv2_s42.yaml")
+    assert cfg1["model"]["backbone"] == "tf_efficientnetv2_s"
+    assert cfg1["model"]["embedding_dim"] == 1280
+    assert cfg1["phase2"]["swa_start_epoch"] == 20
+    assert cfg1["phase2"]["source_loss_weights"] == [1.0, 1.5, 1.0, 1.0]
+    assert cfg1["eval"]["tta"] == "multi"
+
+    cfg2 = load_config("configs/exp_b3_s7.yaml")
+    assert cfg2["seed"] == 7
+    assert cfg2["model"]["backbone"] == "efficientnet_b3"
+
+
 # ========== RUN ALL ==========
 
 if __name__ == "__main__":
@@ -408,7 +521,24 @@ if __name__ == "__main__":
     print("\n9. Checkpoint")
     test("Save and load checkpoint", test_checkpoint_save_load)
 
+    print("\n10. Per-Source Threshold Sweep")
+    test("Per-source threshold sweep", test_per_source_threshold_sweep)
+    test("Per-source >= global threshold", test_per_source_vs_global_threshold)
+
+    print("\n11. Enhanced TTA")
+    test("Multi-flip TTA", test_multi_flip_tta)
+
+    print("\n12. EfficientNetV2-S")
+    test("EfficientNetV2-S backbone", test_effv2_model)
+
+    print("\n13. SWA")
+    test("SWA model creation + forward", test_swa_model)
+
+    print("\n14. New Configs")
+    test("New experiment configs load", test_new_configs)
+
     print("\n" + "=" * 60)
     print(f"RESULTS: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
     print("=" * 60)
     sys.exit(1 if FAIL > 0 else 0)
+

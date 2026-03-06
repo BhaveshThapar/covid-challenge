@@ -2,8 +2,9 @@
 Evaluation script: per-source macro F1, threshold sweep, TTA, and confusion matrices.
 
 Improvements:
-  - Test-Time Augmentation (horizontal flip)
-  - Classification threshold sweep for optimal F1
+  - Test-Time Augmentation (horizontal flip, vertical flip, combined)
+  - Global classification threshold sweep for optimal F1
+  - Per-source threshold sweep for independent per-centre optimization
 """
 import os
 import sys
@@ -23,8 +24,19 @@ from src.utils import load_config, set_seed, compute_per_source_f1, print_confus
 from torch.utils.data import DataLoader
 
 
-def evaluate(model, val_loader, device, use_amp=True, use_tta=False):
-    """Run evaluation and collect predictions + probabilities."""
+def evaluate(model, val_loader, device, use_amp=True, tta_mode="none"):
+    """
+    Run evaluation and collect predictions + probabilities.
+    
+    Args:
+        tta_mode: 'none', 'hflip', 'multi' (hflip+vflip+both), or legacy True/False
+    """
+    # Backward compat: True → 'hflip', False → 'none'
+    if tta_mode is True:
+        tta_mode = "hflip"
+    elif tta_mode is False:
+        tta_mode = "none"
+
     model.eval()
     all_probs, all_labels, all_sources = [], [], []
 
@@ -37,11 +49,24 @@ def evaluate(model, val_loader, device, use_amp=True, use_tta=False):
             with autocast(enabled=use_amp):
                 logits, attn = model(images, masks)
 
-                if use_tta:
-                    # TTA: horizontal flip
-                    images_flip = torch.flip(images, dims=[-1])
-                    logits_flip, _ = model(images_flip, masks)
-                    logits = (logits + logits_flip) / 2.0
+                if tta_mode == "hflip":
+                    images_hflip = torch.flip(images, dims=[-1])
+                    logits_hflip, _ = model(images_hflip, masks)
+                    logits = (logits + logits_hflip) / 2.0
+
+                elif tta_mode == "multi":
+                    # Multi-flip TTA: original + hflip + vflip + hflip+vflip
+                    tta_logits = [logits]
+                    # Horizontal flip
+                    logits_hflip, _ = model(torch.flip(images, dims=[-1]), masks)
+                    tta_logits.append(logits_hflip)
+                    # Vertical flip
+                    logits_vflip, _ = model(torch.flip(images, dims=[-2]), masks)
+                    tta_logits.append(logits_vflip)
+                    # Both flips
+                    logits_hvflip, _ = model(torch.flip(images, dims=[-2, -1]), masks)
+                    tta_logits.append(logits_hvflip)
+                    logits = torch.stack(tta_logits).mean(dim=0)
 
             probs = F.softmax(logits, dim=1).cpu().numpy()
             all_probs.extend(probs)
@@ -74,6 +99,49 @@ def sweep_threshold(probs, labels, sources, class_idx=0):
             best_preds = preds.copy()
 
     return best_f1, best_thresh, best_preds
+
+
+def sweep_threshold_per_source(probs, labels, sources, class_idx=0):
+    """
+    Sweep a separate classification threshold for each data source.
+    
+    Since the competition metric averages per-source F1, optimizing
+    thresholds independently per source can yield a higher combined score.
+    
+    Returns:
+        best_f1, per_source_thresholds (dict), preds_at_best
+    """
+    from sklearn.metrics import f1_score as sklearn_f1
+    p_covid = probs[:, class_idx]
+    sources_arr = np.array(sources)
+    labels_arr = np.array(labels)
+    unique_sources = sorted(np.unique(sources_arr))
+
+    per_source_thresh = {}
+    preds = np.zeros(len(p_covid), dtype=int)
+
+    for src in unique_sources:
+        mask = sources_arr == src
+        p_src = p_covid[mask]
+        l_src = labels_arr[mask]
+
+        best_t, best_src_f1 = 0.5, 0.0
+        for t in np.arange(0.20, 0.80, 0.005):
+            pred_src = np.zeros(mask.sum(), dtype=int)
+            pred_src[p_src <= t] = 1
+            # Only compute F1 for classes present in ground truth (per organizer rules)
+            present_labels = np.unique(l_src)
+            f1 = sklearn_f1(l_src, pred_src, average="macro", labels=present_labels, zero_division=0)
+            if f1 > best_src_f1:
+                best_src_f1 = f1
+                best_t = t
+
+        per_source_thresh[f"source_{src}"] = best_t
+        preds[mask] = 0
+        preds[mask & (p_covid <= best_t)] = 1
+
+    f1_dict = compute_per_source_f1(labels_arr, preds, sources_arr)
+    return f1_dict["average"], per_source_thresh, preds
 
 
 def main():
@@ -121,10 +189,16 @@ def main():
     )
 
     # Evaluate
-    use_tta = config["eval"].get("tta", True) and not args.no_tta
-    print(f"TTA: {'enabled' if use_tta else 'disabled'}")
+    tta_cfg = config["eval"].get("tta", True)
+    if args.no_tta:
+        tta_mode = "none"
+    elif isinstance(tta_cfg, str):
+        tta_mode = tta_cfg  # 'hflip', 'multi', 'none'
+    else:
+        tta_mode = "hflip" if tta_cfg else "none"
+    print(f"TTA mode: {tta_mode}")
 
-    probs, labels, sources = evaluate(model, val_loader, device, use_tta=use_tta)
+    probs, labels, sources = evaluate(model, val_loader, device, tta_mode=tta_mode)
 
     # Standard argmax evaluation
     preds_argmax = probs.argmax(axis=1)
@@ -137,32 +211,51 @@ def main():
         marker = "  ★" if k_name == "average" else ""
         print(f"  {k_name:>12}: {v:.4f}{marker}")
 
+    best_overall_f1 = f1_dict_argmax["average"]
+    preds = preds_argmax
+    f1_dict = f1_dict_argmax
+
     # Threshold sweep
     do_sweep = config["eval"].get("threshold_sweep", True) and not args.no_threshold_sweep
     if do_sweep:
+        # Global threshold sweep
         best_f1, best_thresh, best_preds = sweep_threshold(probs, labels, sources)
         f1_dict_sweep = compute_per_source_f1(labels, best_preds, sources)
 
         print("\n" + "=" * 50)
-        print(f"THRESHOLD SWEEP RESULTS (best threshold={best_thresh:.2f})")
+        print(f"GLOBAL THRESHOLD SWEEP (best t={best_thresh:.2f})")
         print("=" * 50)
         for k_name, v in sorted(f1_dict_sweep.items()):
             marker = "  ★" if k_name == "average" else ""
             print(f"  {k_name:>12}: {v:.4f}{marker}")
 
-        # Use the better result for final reporting
-        if best_f1 > f1_dict_argmax["average"]:
+        if best_f1 > best_overall_f1:
+            best_overall_f1 = best_f1
             preds = best_preds
             f1_dict = f1_dict_sweep
-            print(f"\n  Threshold sweep improved F1 by "
-                  f"+{best_f1 - f1_dict_argmax['average']:.4f}")
+
+        # Per-source threshold sweep
+        ps_f1, ps_thresholds, ps_preds = sweep_threshold_per_source(probs, labels, sources)
+        f1_dict_ps = compute_per_source_f1(labels, ps_preds, sources)
+
+        print("\n" + "=" * 50)
+        print(f"PER-SOURCE THRESHOLD SWEEP")
+        print("=" * 50)
+        for src, t in sorted(ps_thresholds.items()):
+            print(f"  {src}: t={t:.3f}")
+        for k_name, v in sorted(f1_dict_ps.items()):
+            marker = "  ★" if k_name == "average" else ""
+            print(f"  {k_name:>12}: {v:.4f}{marker}")
+
+        if ps_f1 > best_overall_f1:
+            best_overall_f1 = ps_f1
+            preds = ps_preds
+            f1_dict = f1_dict_ps
+            print(f"\n  → Per-source threshold is best (+{ps_f1 - f1_dict_argmax['average']:.4f})")
+        elif best_f1 > f1_dict_argmax["average"]:
+            print(f"\n  → Global threshold is best (+{best_f1 - f1_dict_argmax['average']:.4f})")
         else:
-            preds = preds_argmax
-            f1_dict = f1_dict_argmax
-            print(f"\n  Argmax was better, using argmax results")
-    else:
-        preds = preds_argmax
-        f1_dict = f1_dict_argmax
+            print(f"\n  → Argmax is best")
 
     # Confusion matrices
     print_confusion_matrices(labels, preds, sources)

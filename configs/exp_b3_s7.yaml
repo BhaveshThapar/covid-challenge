@@ -1,0 +1,60 @@
+# Experiment: EfficientNet-B3 + Focal Loss + Embedding Mixup, Seed 7
+# Additional seed diversity for ensemble
+
+data:
+  data_dir: "data"
+  image_size: 256
+  slices_per_scan: 24
+  num_workers: 4
+  pin_memory: true
+
+model:
+  backbone: "efficientnet_b3"
+  pretrained: true
+  embedding_dim: 1536
+  attention_hidden_dim: 256
+  classifier_hidden_dim: 512
+  dropout: 0.5
+  drop_path_rate: 0.3
+  num_classes: 2
+
+phase1:
+  epochs: 20
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 0.01
+  freeze_bn_epochs: 2
+  warmup_epochs: 2
+  max_val_slices_per_scan: 32
+  label_smoothing: 0.1
+  loss_type: "cross_entropy"
+
+phase2:
+  epochs: 30
+  batch_size: 2
+  lr: 1.0e-5
+  weight_decay: 0.05
+  warmup_epochs: 3
+  gradient_accumulation_steps: 16
+  use_amp: true
+  freeze_backbone_epochs: 3
+  backbone_lr_factor: 0.1
+  label_smoothing: 0.05
+  loss_type: "focal"
+  focal_gamma: 2.0
+  focal_alpha: [0.55, 0.45]
+  mixup_alpha: 0.2
+  early_stopping_patience: 8
+  swa_start_epoch: 20               # NEW: start SWA at epoch 20
+  swa_lr: 5.0e-6                    # NEW: SWA learning rate
+  source_loss_weights: [1.0, 1.5, 1.0, 1.0]  # NEW: upweight Centre 1
+
+eval:
+  slices_per_scan: 64                # ↑ from 48
+  batch_size: 1
+  tta: "multi"                       # NEW: multi-flip TTA
+  threshold_sweep: true
+
+seed: 7                              # CHANGED: different seed
+checkpoint_dir: "checkpoints/exp_b3_s7"
+log_dir: "logs/exp_b3_s7"
