@@ -2,6 +2,7 @@
 #SBATCH --job-name=covid-train
 #SBATCH --partition=tron
 #SBATCH --qos=high
+#SBATCH --account=nexus
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
