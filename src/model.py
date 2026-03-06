@@ -163,6 +163,16 @@ class DenseNetMILClassifier(nn.Module):
             if "classifier" not in name:
                 p.requires_grad = False
 
+    def freeze_attention(self) -> None:
+        """Freeze attention MLP. Call in Phase 1 so attention re-trains on adapted features in P2."""
+        for p in self.attention.parameters():
+            p.requires_grad = False
+
+    def unfreeze_attention(self) -> None:
+        """Re-enable attention training. Call at Phase 2 start before building optimizer."""
+        for p in self.attention.parameters():
+            p.requires_grad = True
+
     def unfreeze_block(self, *block_names: str) -> None:
         """Unfreeze parameters whose name contains any of the given block name fragments."""
         for name, p in self.backbone.named_parameters():

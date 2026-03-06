@@ -17,38 +17,32 @@ model:
   dropout: 0.4
   mil_hidden_dim: 128          # Attention MLP hidden dim (1024 → 128 → tanh → 1)
   mixstyle_alpha: 0.1          # Beta(α,α) for MixStyle feature mixing
-  center_weights:              # Asymmetric loss + checkpoint weights
-    0: 1.0
-    1: 1.0
-    2: 0.2
-    3: 1.0
 
-# Phase 1: Frozen backbone, head-only fine-tuning
+# Phase 1: Frozen backbone + frozen attention, classifier-only fine-tuning
 phase1:
-  epochs: 10
+  epochs: 12
   batch_size: 8                # Scan-level MIL (was 32 for slice-level)
   lr: 1.0e-3
   weight_decay: 1.0e-4
   warmup_epochs: 1             # Real linear warmup via SequentialLR
-  early_stop_patience: 10
+  early_stop_patience: 6
   label_smoothing: 0.05        # ε: hard labels → (ε/2, 1-ε/2)
   use_focal_loss: false        # true → FocalLoss(gamma=2) instead of BCEWithLogitsLoss
 
-# Phase 2: Gradual backbone unfreezing
+# Phase 2: Gradual backbone unfreezing (attention re-enabled from epoch 1)
 phase2:
-  # Sub-phase 2a: unfreeze denseblock4 + norm5
-  block4_epochs: 15
+  # Sub-phase 2a: unfreeze denseblock4 + norm5 (primary learning phase)
+  block4_epochs: 25
   block4_lr: 1.0e-4
 
   # Sub-phase 2b: additionally unfreeze denseblock3 + transition3
   block3_epochs: 15
   block3_lr: 3.0e-5
 
-  head_lr: 1.0e-3              # Classifier head LR (constant across both sub-phases)
+  head_lr: 1.0e-3              # Classifier head + attention LR (constant across both sub-phases)
   weight_decay: 1.0e-4
-  warmup_restarts_T0: 5        # CosineAnnealingWarmRestarts T_0 (epochs per restart)
-  use_amp: true                # Mixed precision (FP16)
-  early_stop_patience: 10
+  use_amp: true                # Mixed precision (bfloat16)
+  early_stop_patience: 7
   label_smoothing: 0.05
   use_focal_loss: false
   full_val_every_n_epochs: 999 # Disabled during training (OOM on full-slice); run via evaluate.py

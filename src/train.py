@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,7 +27,7 @@ from src.dataset import (
     ScanDataset, get_val_transforms, scan_collate_fn,
 )
 from src.utils import (
-    set_seed, load_config, get_logger, compute_per_source_f1, compute_weighted_f1,
+    set_seed, load_config, get_logger, compute_per_source_f1,
     EarlyStopping, CheckpointManager,
 )
 from torch.utils.data import DataLoader
@@ -68,7 +68,6 @@ def evaluate_scans(
     device,
     threshold: float = 0.5,
     slices_per_scan: int = None,
-    center_weights: dict = None,
 ) -> dict:
     """
     Scan-level evaluation using MIL forward pass (attention pooling inside model).
@@ -76,10 +75,9 @@ def evaluate_scans(
     Args:
         slices_per_scan: Override slices to sample per scan.
                          None → uses config['eval']['val_slices_per_scan'].
-        center_weights:  If provided, adds 'weighted' key to returned dict.
 
     Returns:
-        dict from compute_per_source_f1: {'source_0': f1, ..., 'average': f1, ['weighted': f1]}
+        dict from compute_per_source_f1: {'source_0': f1, ..., 'average': f1}
     """
     k = slices_per_scan if slices_per_scan is not None else config["eval"]["val_slices_per_scan"]
     img_size = config["data"]["image_size"]
@@ -109,10 +107,7 @@ def evaluate_scans(
             all_labels.extend(labels.numpy())
             all_sources.extend(sources.numpy())
 
-    f1_dict = compute_per_source_f1(all_labels, all_preds, all_sources, strict_labels=False)
-    if center_weights is not None:
-        f1_dict["weighted"] = compute_weighted_f1(f1_dict, center_weights)
-    return f1_dict
+    return compute_per_source_f1(all_labels, all_preds, all_sources, strict_labels=False)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +124,6 @@ def _run_epoch(
     device,
     desc: str,
     pos_weight: torch.Tensor,
-    center_weights: dict = None,
 ) -> float:
     """One scan-level MIL training epoch. Returns average loss."""
     model.train()
@@ -142,7 +136,6 @@ def _run_epoch(
         images = images.to(device)    # (B, K, 3, H, W)
         labels = labels.to(device)    # (B,)
         masks  = masks.to(device)     # (B, K)
-        # sources stays on CPU for dict lookup
 
         # Label smoothing: 0 → ε/2, 1 → 1 − ε/2
         smooth = labels.float() * (1 - label_smooth) + 0.5 * label_smooth
@@ -153,14 +146,7 @@ def _run_epoch(
                 logits, smooth, pos_weight=pw, reduction="none"    # (B,)
             )
 
-        if center_weights is not None:
-            w = torch.tensor(
-                [center_weights.get(int(s), 1.0) for s in sources],
-                dtype=per_loss.dtype, device=per_loss.device,
-            )
-            loss = (per_loss * w).mean()
-        else:
-            loss = per_loss.mean()
+        loss = per_loss.mean()
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -205,6 +191,7 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
         mixstyle_alpha=config["model"].get("mixstyle_alpha", 0.1),
     ).to(device)
     model.freeze_backbone()
+    model.freeze_attention()
     logger.info(f"Trainable parameters: {model.trainable_param_count():,}")
 
     # Compute pos_weight from scan-level labels
@@ -213,8 +200,6 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
     n_noncovid = labels_list.count(1)
     pos_weight = torch.tensor([n_noncovid / max(n_covid, 1)])
     logger.info(f"Class counts — covid: {n_covid}, non-covid: {n_noncovid}, pos_weight: {pos_weight.item():.3f}")
-
-    center_weights = config["model"].get("center_weights")
 
     # Optimizer + real linear warmup → cosine decay
     p1 = config["phase1"]
@@ -242,14 +227,13 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
         avg_loss = _run_epoch(
             model, train_loader, optimizer, scaler, use_amp,
             label_smooth, device, desc=f"P1 Epoch {epoch}/{epochs}",
-            pos_weight=pos_weight, center_weights=center_weights,
+            pos_weight=pos_weight,
         )
         scheduler.step()
 
-        f1_dict   = evaluate_scans(model, val_entries, config, device, center_weights=center_weights)
-        score     = f1_dict.get("weighted", f1_dict["average"])
-        plain_f1  = f1_dict["average"]
-        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f} | plain F1={plain_f1:.4f} | weighted F1={score:.4f}")
+        f1_dict = evaluate_scans(model, val_entries, config, device)
+        score   = f1_dict["average"]
+        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f} | val F1={score:.4f}")
         _log_f1(f1_dict, writer, epoch, logger)
         writer.add_scalar("loss/train_phase1", avg_loss, epoch)
 
@@ -257,14 +241,14 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
             best_f1 = score
             p1_ckpt = f"{config['run_name']}_phase1_best.pt"
             ckpt_mgr.save_named(model, optimizer, epoch, best_f1, p1_ckpt)
-            logger.info(f"  → New best weighted F1: {best_f1:.4f} (saved {p1_ckpt})")
+            logger.info(f"  → New best F1: {best_f1:.4f} (saved {p1_ckpt})")
 
         if early_stop(score):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
     writer.close()
-    logger.info(f"Phase 1 complete. Best weighted F1: {best_f1:.4f}")
+    logger.info(f"Phase 1 complete. Best F1: {best_f1:.4f}")
 
     # Reload best weights before returning
     CheckpointManager.load(
@@ -293,16 +277,15 @@ def _run_subphase(
     n_epochs: int,
     save_name: str,
     pos_weight: torch.Tensor,
-    center_weights: dict = None,
     epoch_offset: int = 0,
 ) -> tuple:
-    """Run one unfreezing sub-phase. Returns (best_weighted_f1, final_epoch)."""
+    """Run one unfreezing sub-phase. Returns (best_f1, final_epoch)."""
     p2 = config[phase_key]
     use_amp = p2.get("use_amp", True)
 
     param_groups = model.get_parameter_groups(head_lr, block_lrs)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=p2["weight_decay"])
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=p2["warmup_restarts_T0"])
+    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)
     scaler = GradScaler("cuda", enabled=use_amp)
 
     label_smooth   = p2.get("label_smoothing", 0.05)
@@ -318,29 +301,27 @@ def _run_subphase(
         avg_loss = _run_epoch(
             model, train_loader, optimizer, scaler, use_amp,
             label_smooth, device, desc=f"{save_name} Epoch {epoch}/{n_epochs}",
-            pos_weight=pos_weight, center_weights=center_weights,
+            pos_weight=pos_weight,
         )
         scheduler.step()
         writer.add_scalar(f"loss/train_{save_name}", avg_loss, global_epoch)
 
         # Fast validation every epoch
-        f1_dict   = evaluate_scans(model, val_entries, config, device, center_weights=center_weights)
-        score     = f1_dict.get("weighted", f1_dict["average"])
-        plain_f1  = f1_dict["average"]
-        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f} | plain F1={plain_f1:.4f} | weighted F1={score:.4f}")
+        f1_dict = evaluate_scans(model, val_entries, config, device)
+        score   = f1_dict["average"]
+        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f} | val F1={score:.4f}")
         _log_f1(f1_dict, writer, global_epoch, logger)
 
         # Full-slice validation every N epochs
         if epoch % full_val_every == 0:
-            full_f1 = evaluate_scans(model, val_entries, config, device,
-                                     slices_per_scan=-1, center_weights=center_weights)
+            full_f1 = evaluate_scans(model, val_entries, config, device, slices_per_scan=-1)
             logger.info(f"  Full-slice val F1: {full_f1['average']:.4f}")
             _log_f1(full_f1, writer, global_epoch, logger, prefix="fullslice_")
 
         if score > best_f1:
             best_f1 = score
             ckpt_mgr.save_named(model, optimizer, epoch, best_f1, f"{save_name}_best.pt")
-            logger.info(f"  → New best weighted F1: {best_f1:.4f} (saved {save_name}_best.pt)")
+            logger.info(f"  → New best F1: {best_f1:.4f} (saved {save_name}_best.pt)")
 
         if early_stop(score):
             logger.info(f"Early stopping at epoch {epoch}")
@@ -381,7 +362,6 @@ def train_phase2(
     n_covid    = labels_list.count(0)
     n_noncovid = labels_list.count(1)
     pos_weight = torch.tensor([n_noncovid / max(n_covid, 1)])
-    center_weights = config["model"].get("center_weights")
 
     p2 = config["phase2"]
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
@@ -391,6 +371,7 @@ def train_phase2(
     # ---- Sub-phase 2a: unfreeze denseblock4 + norm5 ----
     logger.info("Sub-phase 2a: Unfreezing denseblock4 + norm5")
     model.unfreeze_block("denseblock4", "norm5")
+    model.unfreeze_attention()
 
     rn = config["run_name"]
 
@@ -409,7 +390,6 @@ def train_phase2(
         n_epochs=p2["block4_epochs"],
         save_name=f"{rn}_phase2a",
         pos_weight=pos_weight,
-        center_weights=center_weights,
         epoch_offset=0,
     )
     overall_best_f1 = max(overall_best_f1, f1_2a)
@@ -422,6 +402,7 @@ def train_phase2(
         os.path.join(config["checkpoint_dir"], f"{rn}_phase2a_best.pt"), model, device=device
     )
     model.unfreeze_block("denseblock3", "transition3")
+    model.unfreeze_attention()
 
     f1_2b, _ = _run_subphase(
         model=model,
@@ -441,7 +422,6 @@ def train_phase2(
         n_epochs=p2["block3_epochs"],
         save_name=f"{rn}_phase2b",
         pos_weight=pos_weight,
-        center_weights=center_weights,
         epoch_offset=ep_offset,
     )
     overall_best_f1 = max(overall_best_f1, f1_2b)
@@ -488,6 +468,7 @@ def train_phase2b_only(
     ).to(device)
     model.freeze_backbone()
     model.unfreeze_block("denseblock4", "norm5", "denseblock3", "transition3")
+    model.unfreeze_attention()
     epoch_2a, f1_2a = CheckpointManager.load(phase2a_path, model, device=device)
     logger.info(f"Loaded Phase 2a checkpoint (epoch {epoch_2a}, F1={f1_2a:.4f})")
 
@@ -496,7 +477,6 @@ def train_phase2b_only(
     n_covid    = labels_list.count(0)
     n_noncovid = labels_list.count(1)
     pos_weight = torch.tensor([n_noncovid / max(n_covid, 1)])
-    center_weights = config["model"].get("center_weights")
 
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
     writer = SummaryWriter(log_dir=os.path.join(config["log_dir"], "phase2b"))
@@ -519,7 +499,6 @@ def train_phase2b_only(
         n_epochs=p2["block3_epochs"],
         save_name=f"{rn}_phase2b",
         pos_weight=pos_weight,
-        center_weights=center_weights,
         epoch_offset=p2["block4_epochs"],  # match TensorBoard x-axis of full phase2 run
     )
 

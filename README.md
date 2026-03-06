@@ -17,7 +17,7 @@ CT Scan (K=64 slices)
   → Per-center threshold → Covid / Non-Covid
 ```
 
-**Metric:** Plain average macro F1 across 4 centres (challenge score). Checkpoint selection uses weighted F1 = (F1₀ + F1₁ + 0.2·F1₂ + F1₃) / 3.2.
+**Metric:** Plain average macro F1 across 4 centres (challenge score). Checkpoint selection uses the same plain average F1 — all centres equally weighted.
 
 ## Project Structure
 
@@ -28,7 +28,7 @@ covid-challenge/
 │   ├── dataset.py     # ScanDataset, SliceDataset, ROI crop, CenterBatchSampler, intensity TTA transforms
 │   ├── train.py       # Scan-level MIL training: Phase 1 (frozen) + Phase 2 (gradual unfreeze)
 │   ├── evaluate.py    # MIL inference, intensity TTA, per-center threshold tuning, per-source F1
-│   └── utils.py       # Weighted F1, checkpointing, early stopping
+│   └── utils.py       # Checkpointing, early stopping, per-source F1
 ├── scripts/
 │   └── download_and_extract.py  # gdown download + archive extraction + dataset analysis
 ├── slurm/
@@ -129,7 +129,7 @@ python src/evaluate.py \
     --metadata-dir datasets
 ```
 
-Outputs per-center thresholds, per-source F1, weighted F1, and challenge score:
+Outputs per-center thresholds, per-source F1, and challenge score:
 ```
 Per-center thresholds: {0: '0.45 (F1=0.xxxx)', 1: '0.50 ...', 2: '0.38 ...', 3: '0.47 ...'}
 
@@ -142,7 +142,6 @@ PER-SOURCE MACRO F1 SCORES [No TTA]
     source_3: 0.xxxx
      average: 0.xxxx  ★
   [sklearn legacy (classes in y_true∪y_pred)]: avg = 0.xxxx
-  Weighted F1 (checkpoint metric): 0.xxxx
 
 Final Challenge Score (P): 0.xxxx
 ```
@@ -163,18 +162,21 @@ Flags:
 | Slices/scan (training) | 64 per scan (MIL bag) |
 | Slices/scan (fast val) | 48 per scan (MIL forward) |
 | Phase 1 batch size | 8 scans |
-| Phase 1 LR | 1e-3 (head only) |
-| Phase 2a LR | 1e-4 (denseblock4) |
-| Phase 2b LR | 3e-5 (denseblock3) |
+| Phase 1 | 12 epochs, classifier-only (backbone + attention frozen), patience=6 |
+| Phase 2a | 25 epochs, unfreeze denseblock4+norm5+attention, patience=7 |
+| Phase 2b | 15 epochs, additionally unfreeze denseblock3+transition3, patience=7 |
+| Phase 1 LR | 1e-3 (classifier only) |
+| Phase 2a LR | 1e-4 (denseblock4); 1e-3 (head + attention) |
+| Phase 2b LR | 3e-5 (denseblock3); 1e-4 (denseblock4); 1e-3 (head + attention) |
+| Phase 2 scheduler | CosineAnnealingLR(T_max=n_epochs) — smooth decay, no LR spikes |
 | Training augmentations | RandomGamma(85–115, p=0.5), CLAHE(p=0.3), GaussNoise(σ≈0.01, p=0.2) |
-| Loss | Per-sample BCE + asymmetric center weights {0:1.0, 1:1.0, 2:0.2, 3:1.0} + label smoothing (ε=0.05) |
-| Checkpoint metric | Weighted avg F1 = (F1₀ + F1₁ + 0.2·F1₂ + F1₃) / 3.2 |
+| Loss | Per-sample BCE, all centres equally weighted + label smoothing (ε=0.05) |
+| Checkpoint metric | Plain average F1 across 4 centres (= challenge metric) |
 | Grad clipping | max_norm=1.0 |
-| Batch sampler | Center-stratified at scan level |
+| Batch sampler | Center-and-class-stratified at scan level (1 COVID + 1 Non-COVID per centre per batch) |
 | Threshold | Per-center sweep 0.30–0.70 (4 independent thresholds) |
 | TTA | 4 intensity passes: identity, γ=0.9, γ=1.1, CLAHE |
 | F1 reporting | Dual: strict challenge formula (labels=[0,1]) + sklearn legacy |
-| Early stopping patience | 10 epochs (on weighted F1) |
 | AMP | bfloat16 Phase 2; float32 Phase 1 |
 | Eval batch size | 1 scan |
 

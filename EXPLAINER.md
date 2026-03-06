@@ -58,24 +58,25 @@ Think of it as **a doctor who studies a whole patient chart at once, paying more
 
 Teaching happens in **3 stages** — think of it like gradually handing a student more freedom:
 
-### Stage 1 — Head-Only Fine-Tuning (10 epochs)
-- The DenseNet backbone is completely **frozen** — its weights don't change
-- Only the tiny classification head (2 layers) is trained
-- This is fast and avoids breaking the useful medical features already learned from RadImageNet
-- Learning rate: 1e-3
+### Stage 1 — Classifier-Only Fine-Tuning (12 epochs)
+- The DenseNet backbone **and** the attention MLP are completely **frozen** — their weights don't change
+- Only the final linear classifier is trained, on top of uniform-average-pooled RadImageNet features
+- This establishes a baseline mapping before the backbone adapts to CT images
+- Learning rate: 1e-3; early stopping patience: 6 epochs
 
-### Stage 2a — Unfreeze the Top Block (15 epochs)
-- We unfreeze `denseblock4` (the last dense block) and let those layers adapt
-- The head keeps training at the same speed; denseblock4 trains slower (lr=1e-4) so we don't overwrite too fast
-- The scheduler restarts every 5 epochs (cosine annealing with warm restarts)
+### Stage 2a — Unfreeze the Top Block (25 epochs)
+- We unfreeze `denseblock4` + `norm5`, and **re-enable the attention MLP** so it learns on CT-adapted features from scratch
+- The head + attention train at lr=1e-3; denseblock4 trains slower (lr=1e-4) to avoid overwriting useful features
+- Scheduler: CosineAnnealingLR decaying smoothly over the full 25-epoch budget (no LR spikes)
+- This is the primary learning phase — responsible for most of the F1 gain
 
 ### Stage 2b — Unfreeze One Block Deeper (15 epochs)
 - We additionally unfreeze `denseblock3`, at an even slower rate (lr=3e-5)
-- The optimizer is reinitialised fresh from the best Stage 2a checkpoint
+- The optimizer is reinitialised fresh from the best Stage 2a checkpoint; attention remains enabled
 - The best checkpoint across all stages is saved as `checkpoints/v3_ovr_best.pt`
 - If a job is killed between Stage 2a and 2b, `--phase 3` resumes from the saved Stage 2a checkpoint
 
-After each epoch we evaluate on the validation scans (scan-level MIL forward, 48 slices per scan) and compute the **weighted F1** = (F1₀ + F1₁ + 0.2·F1₂ + F1₃) / 3.2 — this down-weights Centre 2 which is smallest and noisiest. Checkpoints are saved when weighted F1 improves; training stops early after 10 epochs without improvement.
+After each epoch we evaluate on the validation scans (scan-level MIL forward, 48 slices per scan) and compute the **plain average macro F1** across all 4 centres — this is the challenge metric directly. All centres are equally weighted. Checkpoints are saved when average F1 improves; early stopping patience is 7 epochs in Phase 2.
 
 ---
 
@@ -111,9 +112,9 @@ After each epoch we evaluate on the validation scans (scan-level MIL forward, 48
 |------|-------------|
 | `src/model.py` | `DenseNetMILClassifier`: DenseNet-121 backbone + MixStyle + ABMIL attention head. `DenseNetCovidClassifier` kept for backward compatibility with v1/v2 checkpoints. |
 | `src/dataset.py` | Lung ROI crop (`_load_image_with_roi`), `ScanDataset` for MIL bag loading, intensity-only augmentations and TTA, `CenterBatchSampler` (scan-level), `build_scan_train_dataloader`. |
-| `src/train.py` | Scan-level MIL training: per-sample BCE with asymmetric center weights, weighted F1 checkpoint selection, all 3 phases. |
-| `src/evaluate.py` | MIL inference, intensity TTA, `tune_thresholds_per_center` (4 independent thresholds), `print_results` with weighted F1 display. |
-| `src/utils.py` | `compute_weighted_f1`, rotation-safe checkpointing, per-hospital F1, early stopping. |
+| `src/train.py` | Scan-level MIL training: per-sample BCE (all centres equally weighted), plain average F1 checkpoint selection, all 3 phases. |
+| `src/evaluate.py` | MIL inference, intensity TTA, `tune_thresholds_per_center` (4 independent thresholds), `print_results` with per-source F1 display. |
+| `src/utils.py` | Rotation-safe checkpointing, per-hospital F1, early stopping. |
 | `scripts/download_and_extract.py` | Downloads data from Google Drive and organises it into the right folder structure |
 | `slurm/train.sbatch` | The "note" we hand to the supercomputer to train the model |
 | `slurm/extract.sbatch` | The "note" to download and unpack the data |
