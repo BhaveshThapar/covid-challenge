@@ -1,11 +1,11 @@
 # Multi-Source Covid-19 Detection — Default Configuration
-# Aadit's pipeline: DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation
+# Aadit's pipeline: DenseNet-121 + RadImageNet, scan-level MIL training (v3)
 
 # Data
 data:
   data_dir: "data"
   image_size: 224
-  slices_per_scan: 64          # Max slices sampled per scan during slice-level training
+  slices_per_scan: 64          # K slices sampled per scan during training
   num_workers: 8
   pin_memory: true
 
@@ -15,11 +15,18 @@ model:
   pretrained_path: "checkpoints/radimagenet_densenet121.pt"
   embedding_dim: 1024          # DenseNet-121 feature dim
   dropout: 0.4
+  mil_hidden_dim: 128          # Attention MLP hidden dim (1024 → 128 → tanh → 1)
+  mixstyle_alpha: 0.1          # Beta(α,α) for MixStyle feature mixing
+  center_weights:              # Asymmetric loss + checkpoint weights
+    0: 1.0
+    1: 1.0
+    2: 0.2
+    3: 1.0
 
 # Phase 1: Frozen backbone, head-only fine-tuning
 phase1:
   epochs: 10
-  batch_size: 32               # Used by CenterBatchSampler
+  batch_size: 8                # Scan-level MIL (was 32 for slice-level)
   lr: 1.0e-3
   weight_decay: 1.0e-4
   warmup_epochs: 1             # Real linear warmup via SequentialLR

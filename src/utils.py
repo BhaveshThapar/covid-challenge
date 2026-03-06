@@ -46,6 +46,28 @@ def compute_macro_f1(y_true, y_pred):
     return f1_score(y_true, y_pred, average="macro", zero_division=0)
 
 
+def compute_weighted_f1(f1_dict: dict, center_weights: dict = None) -> float:
+    """
+    Weighted average of per-center F1 for checkpoint selection.
+
+    Args:
+        f1_dict:        Output of compute_per_source_f1 — keys like 'source_0', 'average'.
+        center_weights: {0: 1.0, 1: 1.0, 2: 0.2, 3: 1.0}
+                        Falls back to plain average if None.
+
+    Returns:
+        float — weighted F1 score. Denominator = sum of all weights (e.g. 3.2).
+    """
+    if center_weights is None:
+        return f1_dict.get("average", 0.0)
+    total_w = sum(center_weights.values())
+    weighted = sum(
+        center_weights.get(src_id, 0.0) * f1_dict.get(f"source_{src_id}", 0.0)
+        for src_id in center_weights
+    )
+    return weighted / max(total_w, 1e-9)
+
+
 def compute_per_source_f1(y_true, y_pred, sources, strict_labels=True):
     """
     Compute macro F1 per data source, then average.

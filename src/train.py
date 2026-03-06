@@ -1,10 +1,10 @@
 """
 Training script for the Multi-Source Covid-19 Detection Challenge.
 
-Phase 1: Frozen DenseNet-121 backbone, head-only training (slice-level)
+Phase 1: Frozen DenseNet-121 backbone, head-only training (scan-level MIL)
 Phase 2: Gradual backbone unfreezing — sub-phase 2a (denseblock4) then 2b (denseblock3)
 
-Both phases train at the slice level; validation is at the scan level via evaluate_scans().
+Both phases train at the scan level using DenseNetMILClassifier with attention pooling.
 """
 import os
 import sys
@@ -21,13 +21,13 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.model import DenseNetCovidClassifier
+from src.model import DenseNetMILClassifier
 from src.dataset import (
-    build_slice_dataloaders, build_scan_manifest,
+    build_scan_train_dataloader, build_scan_manifest,
     ScanDataset, get_val_transforms, scan_collate_fn,
 )
 from src.utils import (
-    set_seed, load_config, get_logger, compute_per_source_f1,
+    set_seed, load_config, get_logger, compute_per_source_f1, compute_weighted_f1,
     EarlyStopping, CheckpointManager,
 )
 from torch.utils.data import DataLoader
@@ -62,23 +62,24 @@ def build_criterion(config: dict, phase_key: str, pos_weight: torch.Tensor, devi
 # ---------------------------------------------------------------------------
 
 def evaluate_scans(
-    model: DenseNetCovidClassifier,
+    model: DenseNetMILClassifier,
     val_entries: list,
     config: dict,
     device,
     threshold: float = 0.5,
     slices_per_scan: int = None,
+    center_weights: dict = None,
 ) -> dict:
     """
-    Scan-level evaluation: aggregate per-slice sigmoid probabilities by averaging,
-    then apply threshold to obtain a binary prediction per scan.
+    Scan-level evaluation using MIL forward pass (attention pooling inside model).
 
     Args:
         slices_per_scan: Override slices to sample per scan.
                          None → uses config['eval']['val_slices_per_scan'].
+        center_weights:  If provided, adds 'weighted' key to returned dict.
 
     Returns:
-        dict from compute_per_source_f1: {'source_0': f1, ..., 'average': f1}
+        dict from compute_per_source_f1: {'source_0': f1, ..., 'average': f1, ['weighted': f1]}
     """
     k = slices_per_scan if slices_per_scan is not None else config["eval"]["val_slices_per_scan"]
     img_size = config["data"]["image_size"]
@@ -98,21 +99,20 @@ def evaluate_scans(
 
     with torch.no_grad():
         for images, labels, sources, masks in val_loader:
-            B, K, C, H, W = images.shape
-            x_flat = images.view(B * K, C, H, W).to(device)
-
-            logits = model(x_flat).squeeze(-1)          # (B*K,)
-            probs = torch.sigmoid(logits).view(B, K)    # (B, K)
-
-            valid = masks.float().to(device)            # (B, K)
-            scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)  # (B,)
-            preds = (scan_probs >= threshold).long().cpu().numpy()
+            images = images.to(device)
+            masks  = masks.to(device)
+            logits = model(images, mask=masks).squeeze(-1)    # (B,) — MIL aggregation in model
+            probs  = torch.sigmoid(logits)
+            preds  = (probs >= threshold).long().cpu().numpy()
 
             all_preds.extend(preds)
             all_labels.extend(labels.numpy())
             all_sources.extend(sources.numpy())
 
-    return compute_per_source_f1(all_labels, all_preds, all_sources, strict_labels=False)
+    f1_dict = compute_per_source_f1(all_labels, all_preds, all_sources, strict_labels=False)
+    if center_weights is not None:
+        f1_dict["weighted"] = compute_weighted_f1(f1_dict, center_weights)
+    return f1_dict
 
 
 # ---------------------------------------------------------------------------
@@ -120,32 +120,47 @@ def evaluate_scans(
 # ---------------------------------------------------------------------------
 
 def _run_epoch(
-    model: DenseNetCovidClassifier,
+    model: DenseNetMILClassifier,
     train_loader,
-    criterion,
     optimizer,
     scaler: GradScaler,
     use_amp: bool,
     label_smooth: float,
     device,
     desc: str,
+    pos_weight: torch.Tensor,
+    center_weights: dict = None,
 ) -> float:
-    """One training epoch. Returns average loss."""
+    """One scan-level MIL training epoch. Returns average loss."""
     model.train()
     total_loss = 0.0
-    n_batches = 0
+    n_batches  = 0
+    pw = pos_weight.to(device)
 
     pbar = tqdm(train_loader, desc=desc)
-    for images, labels, sources in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
+    for images, labels, sources, masks in pbar:    # 4-tuple from scan_collate_fn
+        images = images.to(device)    # (B, K, 3, H, W)
+        labels = labels.to(device)    # (B,)
+        masks  = masks.to(device)     # (B, K)
+        # sources stays on CPU for dict lookup
 
         # Label smoothing: 0 → ε/2, 1 → 1 − ε/2
-        smooth_labels = labels.float() * (1 - label_smooth) + 0.5 * label_smooth
+        smooth = labels.float() * (1 - label_smooth) + 0.5 * label_smooth
 
         with autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            logits = model(images).squeeze(-1)          # (B,)
-            loss = criterion(logits, smooth_labels)
+            logits   = model(images, mask=masks).squeeze(-1)    # (B,)
+            per_loss = F.binary_cross_entropy_with_logits(
+                logits, smooth, pos_weight=pw, reduction="none"    # (B,)
+            )
+
+        if center_weights is not None:
+            w = torch.tensor(
+                [center_weights.get(int(s), 1.0) for s in sources],
+                dtype=per_loss.dtype, device=per_loss.device,
+            )
+            loss = (per_loss * w).mean()
+        else:
+            loss = per_loss.mean()
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -155,7 +170,7 @@ def _run_epoch(
         scaler.update()
 
         total_loss += loss.item()
-        n_batches += 1
+        n_batches  += 1
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     return total_loss / max(n_batches, 1)
@@ -173,29 +188,33 @@ def _log_f1(f1_dict: dict, writer: SummaryWriter, epoch: int, logger, prefix: st
 # Phase 1: Frozen backbone, head-only
 # ---------------------------------------------------------------------------
 
-def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger) -> DenseNetCovidClassifier:
+def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger) -> DenseNetMILClassifier:
     logger.info("=" * 60)
-    logger.info("PHASE 1: Frozen Backbone — Head-Only Fine-Tuning")
+    logger.info("PHASE 1: Frozen Backbone — Head-Only Fine-Tuning (Scan-Level MIL)")
     logger.info("=" * 60)
 
-    train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
-    logger.info(f"Train slices: {len(train_loader.dataset)}, Val scans: {len(val_entries)}")
+    train_loader, val_entries = build_scan_train_dataloader(data_dir, metadata_dir, config)
+    logger.info(f"Train scans: {len(train_loader.dataset)}, Val scans: {len(val_entries)}")
 
     # Model — load RadImageNet weights, freeze backbone
     pretrained_path = config["model"].get("pretrained_path", "")
-    model = DenseNetCovidClassifier(
+    model = DenseNetMILClassifier(
         pretrained_path=pretrained_path,
         dropout=config["model"]["dropout"],
+        mil_hidden_dim=config["model"].get("mil_hidden_dim", 128),
+        mixstyle_alpha=config["model"].get("mixstyle_alpha", 0.1),
     ).to(device)
     model.freeze_backbone()
     logger.info(f"Trainable parameters: {model.trainable_param_count():,}")
 
-    # Compute pos_weight from training labels
-    labels_list = [s[1] for s in train_loader.dataset.samples]
-    n_covid = labels_list.count(0)
+    # Compute pos_weight from scan-level labels
+    labels_list = [e["label"] for e in train_loader.dataset.entries]
+    n_covid    = labels_list.count(0)
     n_noncovid = labels_list.count(1)
     pos_weight = torch.tensor([n_noncovid / max(n_covid, 1)])
     logger.info(f"Class counts — covid: {n_covid}, non-covid: {n_noncovid}, pos_weight: {pos_weight.item():.3f}")
+
+    center_weights = config["model"].get("center_weights")
 
     # Optimizer + real linear warmup → cosine decay
     p1 = config["phase1"]
@@ -210,7 +229,6 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
     scheduler = SequentialLR(optimizer, schedulers=[linear_sched, cosine_sched],
                               milestones=[warmup_e])
 
-    criterion = build_criterion(config, "phase1", pos_weight, device)
     label_smooth = p1.get("label_smoothing", 0.05)
     use_amp = False  # head-only: fast enough without AMP
     scaler = GradScaler("cuda", enabled=use_amp)
@@ -222,28 +240,31 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
 
     for epoch in range(1, epochs + 1):
         avg_loss = _run_epoch(
-            model, train_loader, criterion, optimizer, scaler, use_amp,
+            model, train_loader, optimizer, scaler, use_amp,
             label_smooth, device, desc=f"P1 Epoch {epoch}/{epochs}",
+            pos_weight=pos_weight, center_weights=center_weights,
         )
         scheduler.step()
 
-        f1_dict = evaluate_scans(model, val_entries, config, device)
-        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f}, per-center F1:")
+        f1_dict   = evaluate_scans(model, val_entries, config, device, center_weights=center_weights)
+        score     = f1_dict.get("weighted", f1_dict["average"])
+        plain_f1  = f1_dict["average"]
+        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f} | plain F1={plain_f1:.4f} | weighted F1={score:.4f}")
         _log_f1(f1_dict, writer, epoch, logger)
         writer.add_scalar("loss/train_phase1", avg_loss, epoch)
 
-        if f1_dict["average"] > best_f1:
-            best_f1 = f1_dict["average"]
+        if score > best_f1:
+            best_f1 = score
             p1_ckpt = f"{config['run_name']}_phase1_best.pt"
             ckpt_mgr.save_named(model, optimizer, epoch, best_f1, p1_ckpt)
-            logger.info(f"  → New best F1: {best_f1:.4f} (saved {p1_ckpt})")
+            logger.info(f"  → New best weighted F1: {best_f1:.4f} (saved {p1_ckpt})")
 
-        if early_stop(f1_dict["average"]):
+        if early_stop(score):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
     writer.close()
-    logger.info(f"Phase 1 complete. Best F1: {best_f1:.4f}")
+    logger.info(f"Phase 1 complete. Best weighted F1: {best_f1:.4f}")
 
     # Reload best weights before returning
     CheckpointManager.load(
@@ -258,7 +279,7 @@ def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger)
 # ---------------------------------------------------------------------------
 
 def _run_subphase(
-    model: DenseNetCovidClassifier,
+    model: DenseNetMILClassifier,
     train_loader,
     val_entries: list,
     config: dict,
@@ -271,9 +292,11 @@ def _run_subphase(
     block_lrs: dict,
     n_epochs: int,
     save_name: str,
+    pos_weight: torch.Tensor,
+    center_weights: dict = None,
     epoch_offset: int = 0,
 ) -> tuple:
-    """Run one unfreezing sub-phase. Returns (best_f1, final_epoch)."""
+    """Run one unfreezing sub-phase. Returns (best_weighted_f1, final_epoch)."""
     p2 = config[phase_key]
     use_amp = p2.get("use_amp", True)
 
@@ -282,14 +305,9 @@ def _run_subphase(
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=p2["warmup_restarts_T0"])
     scaler = GradScaler("cuda", enabled=use_amp)
 
-    pos_weight = torch.tensor([
-        sum(1 for s in train_loader.dataset.samples if s[1] == 1) /
-        max(sum(1 for s in train_loader.dataset.samples if s[1] == 0), 1)
-    ])
-    criterion = build_criterion(config, phase_key, pos_weight, device)
-    label_smooth = p2.get("label_smoothing", 0.05)
+    label_smooth   = p2.get("label_smoothing", 0.05)
     full_val_every = p2.get("full_val_every_n_epochs", 5)
-    early_stop = EarlyStopping(patience=p2["early_stop_patience"], mode="max")
+    early_stop     = EarlyStopping(patience=p2["early_stop_patience"], mode="max")
     best_f1 = 0.0
 
     logger.info(f"Trainable parameters: {model.trainable_param_count():,}")
@@ -298,29 +316,33 @@ def _run_subphase(
         global_epoch = epoch_offset + epoch
 
         avg_loss = _run_epoch(
-            model, train_loader, criterion, optimizer, scaler, use_amp,
+            model, train_loader, optimizer, scaler, use_amp,
             label_smooth, device, desc=f"{save_name} Epoch {epoch}/{n_epochs}",
+            pos_weight=pos_weight, center_weights=center_weights,
         )
         scheduler.step()
         writer.add_scalar(f"loss/train_{save_name}", avg_loss, global_epoch)
 
         # Fast validation every epoch
-        f1_dict = evaluate_scans(model, val_entries, config, device)
-        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f}, fast-val F1:")
+        f1_dict   = evaluate_scans(model, val_entries, config, device, center_weights=center_weights)
+        score     = f1_dict.get("weighted", f1_dict["average"])
+        plain_f1  = f1_dict["average"]
+        logger.info(f"Epoch {epoch}: train_loss={avg_loss:.4f} | plain F1={plain_f1:.4f} | weighted F1={score:.4f}")
         _log_f1(f1_dict, writer, global_epoch, logger)
 
         # Full-slice validation every N epochs
         if epoch % full_val_every == 0:
-            full_f1 = evaluate_scans(model, val_entries, config, device, slices_per_scan=-1)
+            full_f1 = evaluate_scans(model, val_entries, config, device,
+                                     slices_per_scan=-1, center_weights=center_weights)
             logger.info(f"  Full-slice val F1: {full_f1['average']:.4f}")
             _log_f1(full_f1, writer, global_epoch, logger, prefix="fullslice_")
 
-        if f1_dict["average"] > best_f1:
-            best_f1 = f1_dict["average"]
+        if score > best_f1:
+            best_f1 = score
             ckpt_mgr.save_named(model, optimizer, epoch, best_f1, f"{save_name}_best.pt")
-            logger.info(f"  → New best F1: {best_f1:.4f} (saved {save_name}_best.pt)")
+            logger.info(f"  → New best weighted F1: {best_f1:.4f} (saved {save_name}_best.pt)")
 
-        if early_stop(f1_dict["average"]):
+        if early_stop(score):
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
@@ -333,22 +355,33 @@ def _run_subphase(
 
 def train_phase2(
     config: dict, data_dir: str, metadata_dir: str, device, logger,
-    phase1_model: DenseNetCovidClassifier = None,
-) -> DenseNetCovidClassifier:
+    phase1_model: DenseNetMILClassifier = None,
+) -> DenseNetMILClassifier:
     logger.info("=" * 60)
-    logger.info("PHASE 2: Gradual Backbone Unfreezing")
+    logger.info("PHASE 2: Gradual Backbone Unfreezing (Scan-Level MIL)")
     logger.info("=" * 60)
 
-    train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
+    train_loader, val_entries = build_scan_train_dataloader(data_dir, metadata_dir, config)
 
     # Load Phase 1 checkpoint if model not passed in
     if phase1_model is None:
         phase1_path = os.path.join(config["checkpoint_dir"], f"{config['run_name']}_phase1_best.pt")
-        model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+        model = DenseNetMILClassifier(
+            dropout=config["model"]["dropout"],
+            mil_hidden_dim=config["model"].get("mil_hidden_dim", 128),
+            mixstyle_alpha=config["model"].get("mixstyle_alpha", 0.1),
+        ).to(device)
         CheckpointManager.load(phase1_path, model, device=device)
         logger.info(f"Loaded Phase 1 checkpoint from {phase1_path}")
     else:
         model = phase1_model
+
+    # Compute pos_weight from scan-level labels
+    labels_list = [e["label"] for e in train_loader.dataset.entries]
+    n_covid    = labels_list.count(0)
+    n_noncovid = labels_list.count(1)
+    pos_weight = torch.tensor([n_noncovid / max(n_covid, 1)])
+    center_weights = config["model"].get("center_weights")
 
     p2 = config["phase2"]
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
@@ -375,6 +408,8 @@ def train_phase2(
         block_lrs={"denseblock4": p2["block4_lr"], "norm5": p2["block4_lr"]},
         n_epochs=p2["block4_epochs"],
         save_name=f"{rn}_phase2a",
+        pos_weight=pos_weight,
+        center_weights=center_weights,
         epoch_offset=0,
     )
     overall_best_f1 = max(overall_best_f1, f1_2a)
@@ -405,6 +440,8 @@ def train_phase2(
         },
         n_epochs=p2["block3_epochs"],
         save_name=f"{rn}_phase2b",
+        pos_weight=pos_weight,
+        center_weights=center_weights,
         epoch_offset=ep_offset,
     )
     overall_best_f1 = max(overall_best_f1, f1_2b)
@@ -434,21 +471,32 @@ def train_phase2b_only(
     Use --phase 3 when Phase 2a already completed but the job was killed before 2b finished.
     """
     logger.info("=" * 60)
-    logger.info("PHASE 2b ONLY: Deepening Backbone Unfreezing (resume)")
+    logger.info("PHASE 2b ONLY: Deepening Backbone Unfreezing (resume, Scan-Level MIL)")
     logger.info("=" * 60)
 
-    train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
+    train_loader, val_entries = build_scan_train_dataloader(data_dir, metadata_dir, config)
 
     rn = config["run_name"]
     p2 = config["phase2"]
     phase2a_path = os.path.join(config["checkpoint_dir"], f"{rn}_phase2a_best.pt")
 
     # Build model with correct freeze state for 2b, then load weights
-    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    model = DenseNetMILClassifier(
+        dropout=config["model"]["dropout"],
+        mil_hidden_dim=config["model"].get("mil_hidden_dim", 128),
+        mixstyle_alpha=config["model"].get("mixstyle_alpha", 0.1),
+    ).to(device)
     model.freeze_backbone()
     model.unfreeze_block("denseblock4", "norm5", "denseblock3", "transition3")
     epoch_2a, f1_2a = CheckpointManager.load(phase2a_path, model, device=device)
     logger.info(f"Loaded Phase 2a checkpoint (epoch {epoch_2a}, F1={f1_2a:.4f})")
+
+    # Compute pos_weight from scan-level labels
+    labels_list = [e["label"] for e in train_loader.dataset.entries]
+    n_covid    = labels_list.count(0)
+    n_noncovid = labels_list.count(1)
+    pos_weight = torch.tensor([n_noncovid / max(n_covid, 1)])
+    center_weights = config["model"].get("center_weights")
 
     ckpt_mgr = CheckpointManager(config["checkpoint_dir"])
     writer = SummaryWriter(log_dir=os.path.join(config["log_dir"], "phase2b"))
@@ -470,6 +518,8 @@ def train_phase2b_only(
         },
         n_epochs=p2["block3_epochs"],
         save_name=f"{rn}_phase2b",
+        pos_weight=pos_weight,
+        center_weights=center_weights,
         epoch_offset=p2["block4_epochs"],  # match TensorBoard x-axis of full phase2 run
     )
 

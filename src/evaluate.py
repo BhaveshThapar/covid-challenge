@@ -18,18 +18,19 @@ import argparse
 
 import numpy as np
 import torch
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from tqdm import tqdm
+from sklearn.metrics import f1_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.model import DenseNetCovidClassifier
+from src.model import DenseNetMILClassifier
 from src.dataset import (
     build_scan_manifest, ScanDataset, RawSliceScanDataset,
     get_val_transforms, get_tta_transforms, scan_collate_fn,
 )
 from src.utils import (
-    load_config, set_seed, compute_per_source_f1,
+    load_config, set_seed, compute_per_source_f1, compute_weighted_f1,
     print_confusion_matrices, CheckpointManager,
 )
 from torch.utils.data import DataLoader
@@ -40,7 +41,7 @@ from torch.utils.data import DataLoader
 # ---------------------------------------------------------------------------
 
 def collect_scan_probs(
-    model: DenseNetCovidClassifier,
+    model: DenseNetMILClassifier,
     val_entries: list,
     config: dict,
     device,
@@ -48,6 +49,7 @@ def collect_scan_probs(
 ) -> tuple:
     """
     Run inference on all validation scans (all slices, no TTA).
+    MIL attention pooling is done inside the model forward.
     Returns (probs, labels, sources) as numpy arrays.
     """
     img_size = config["data"]["image_size"]
@@ -70,17 +72,15 @@ def collect_scan_probs(
 
     with torch.no_grad():
         for images, labels, sources, masks in tqdm(val_loader, desc="Inference"):
-            B, K, C, H, W = images.shape
-            x_flat = images.view(B * K, C, H, W).to(device)
+            images = images.to(device)
+            masks  = masks.to(device)
 
-            with autocast(enabled=use_amp):
-                logits = model(x_flat).squeeze(-1)          # (B*K,)
+            with autocast("cuda", enabled=use_amp):
+                logits = model(images, mask=masks).squeeze(-1)    # (B,) — MIL aggregation in model
 
-            probs = torch.sigmoid(logits).view(B, K)        # (B, K)
-            valid = masks.float().to(device)                # (B, K)
-            scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)  # (B,)
+            probs = torch.sigmoid(logits).cpu().numpy()
 
-            all_probs.extend(scan_probs.cpu().numpy())
+            all_probs.extend(probs)
             all_labels.extend(labels.numpy())
             all_sources.extend(sources.numpy())
 
@@ -88,7 +88,7 @@ def collect_scan_probs(
 
 
 def collect_scan_probs_tta(
-    model: DenseNetCovidClassifier,
+    model: DenseNetMILClassifier,
     val_entries: list,
     config: dict,
     device,
@@ -96,9 +96,9 @@ def collect_scan_probs_tta(
     use_amp: bool = True,
 ) -> tuple:
     """
-    Run TTA inference on all validation scans.
-    For each scan: load raw slice arrays once, apply N transform pipelines,
-    average sigmoid probs across augmentations, then average across slices.
+    Run intensity TTA inference on all validation scans.
+    For each scan: load raw slice arrays once, apply N intensity transform pipelines,
+    run MIL forward per pipeline, average sigmoid probs across augmentations.
 
     Returns (probs, labels, sources) as numpy arrays.
     """
@@ -112,22 +112,20 @@ def collect_scan_probs_tta(
     all_probs, all_labels, all_sources = [], [], []
 
     for idx in tqdm(range(len(raw_ds)), desc=f"TTA Inference (n={tta_n})"):
-        raw_imgs, label, source = raw_ds[idx]   # list of np.ndarray, int, int
-        n_slices = len(raw_imgs)
+        raw_imgs, label, source = raw_ds[idx]   # list of ROI-cropped np.ndarray, int, int
 
-        aug_probs = []  # one entry per TTA augmentation, shape (n_slices,)
+        aug_probs = []  # one scalar per TTA augmentation
         for tfm in tta_tfms:
             tensors = torch.stack([tfm(image=img)["image"] for img in raw_imgs])  # (K, 3, H, W)
-            tensors = tensors.to(device)
+            tensors = tensors.unsqueeze(0).to(device)    # (1, K, 3, H, W)
 
             with torch.no_grad():
-                with autocast(enabled=use_amp):
-                    logits = model(tensors).squeeze(-1)   # (K,)
-            aug_probs.append(torch.sigmoid(logits).cpu().numpy())
+                with autocast("cuda", enabled=use_amp):
+                    logit = model(tensors, mask=None).squeeze()    # scalar — MIL aggregation
+            aug_probs.append(torch.sigmoid(logit).item())
 
-        # Average across TTA augmentations, then average across slices
-        slice_probs = np.mean(aug_probs, axis=0)   # (K,)
-        scan_prob = slice_probs.mean()
+        # Average across 4 intensity TTA passes
+        scan_prob = np.mean(aug_probs)
         all_probs.append(scan_prob)
         all_labels.append(label)
         all_sources.append(source)
@@ -150,6 +148,7 @@ def tune_threshold(
     """
     Sweep thresholds and return (best_threshold, best_avg_f1).
     Optimises the per-source averaged F1 (the challenge metric).
+    Kept as a global fallback — prefer tune_thresholds_per_center for v3.
     """
     best_t, best_f1 = 0.5, 0.0
     for t in np.linspace(lo, hi, steps):
@@ -160,6 +159,32 @@ def tune_threshold(
     return best_t, best_f1
 
 
+def tune_thresholds_per_center(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    sources: np.ndarray,
+    lo: float = 0.3,
+    hi: float = 0.7,
+    steps: int = 41,
+) -> dict:
+    """
+    Tune threshold independently per center (0.01 increments over [lo, hi]).
+    Returns: {center_id: (best_threshold, best_f1)}
+    """
+    result = {}
+    for src in np.unique(sources):
+        mask = sources == src
+        best_t, best_f1 = 0.5, 0.0
+        for t in np.linspace(lo, hi, steps):
+            preds = (probs[mask] >= t).astype(int)
+            f1 = f1_score(labels[mask], preds, average="macro",
+                          zero_division=0, labels=[0, 1])
+            if f1 > best_f1:
+                best_t, best_f1 = float(t), f1
+        result[int(src)] = (best_t, best_f1)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Reporting helpers
 # ---------------------------------------------------------------------------
@@ -168,11 +193,19 @@ def print_results(
     probs: np.ndarray,
     labels: np.ndarray,
     sources: np.ndarray,
-    threshold: float,
+    threshold,                   # float (global) OR dict {center_id: float} (per-center)
     label: str = "",
+    center_weights: dict = None,
 ):
-    preds = (probs >= threshold).astype(int)
-    f1_dict = compute_per_source_f1(labels, preds, sources, strict_labels=True)
+    if isinstance(threshold, dict):
+        preds = np.zeros(len(probs), dtype=int)
+        for src_id, t in threshold.items():
+            mask = sources == src_id
+            preds[mask] = (probs[mask] >= t).astype(int)
+    else:
+        preds = (probs >= threshold).astype(int)
+
+    f1_dict   = compute_per_source_f1(labels, preds, sources, strict_labels=True)
     f1_legacy = compute_per_source_f1(labels, preds, sources, strict_labels=False)
 
     tag = f" [{label}]" if label else ""
@@ -183,6 +216,9 @@ def print_results(
         marker = "  ★" if k == "average" else ""
         print(f"  {k:>12}: {v:.4f}{marker}")
     print(f"  [sklearn legacy (classes in y_true∪y_pred)]: avg = {f1_legacy['average']:.4f}")
+    if center_weights:
+        print(f"  Weighted F1 (checkpoint metric): "
+              f"{compute_weighted_f1(f1_dict, center_weights):.4f}")
 
     print_confusion_matrices(labels, preds, sources)
 
@@ -215,9 +251,15 @@ def main():
     use_amp = config.get("phase2", {}).get("use_amp", True)
 
     # Model
-    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    model = DenseNetMILClassifier(
+        dropout=config["model"]["dropout"],
+        mil_hidden_dim=config["model"].get("mil_hidden_dim", 128),
+        mixstyle_alpha=config["model"].get("mixstyle_alpha", 0.1),
+    ).to(device)
     epoch, score = CheckpointManager.load(args.checkpoint, model, device=device)
     print(f"Loaded checkpoint from epoch {epoch}, training score={score:.4f}")
+
+    center_weights = config["model"].get("center_weights")
 
     # Data
     val_entries = build_scan_manifest(args.data_dir, args.split, args.metadata_dir)
@@ -236,25 +278,30 @@ def main():
     if args.no_tune_threshold:
         thresh_base = eval_cfg.get("threshold", 0.5)
         print(f"Using config threshold: {thresh_base:.2f}")
+        print_results(probs, labels, sources, thresh_base, label="No TTA", center_weights=center_weights)
     else:
-        thresh_base, f1_tuned = tune_threshold(probs, labels, sources, lo, hi, steps)
-        print(f"Tuned threshold (no TTA): {thresh_base:.2f}  →  avg F1: {f1_tuned:.4f}")
-
-    print_results(probs, labels, sources, thresh_base, label="No TTA")
+        # Per-center threshold tuning
+        per_center = tune_thresholds_per_center(probs, labels, sources, lo, hi, steps)
+        print(f"Per-center thresholds: { {c: f'{t:.2f} (F1={f:.4f})' for c, (t, f) in per_center.items()} }")
+        thresh_dict = {c: t for c, (t, _) in per_center.items()}
+        print_results(probs, labels, sources, thresh_dict, label="No TTA", center_weights=center_weights)
 
     # ---- Step 2: TTA inference (if enabled) ----
     if tta_n > 0:
         print(f"\n--- Running TTA inference (n={tta_n})...")
         tta_probs, _, _ = collect_scan_probs_tta(model, val_entries, config, device, tta_n, use_amp)
 
-        # Independently tune threshold on TTA probabilities (distribution differs from no-TTA)
         if args.no_tune_threshold:
             thresh_tta = eval_cfg.get("threshold", 0.5)
+            print_results(tta_probs, labels, sources, thresh_tta,
+                          label=f"TTA n={tta_n}", center_weights=center_weights)
         else:
-            thresh_tta, f1_tta_tuned = tune_threshold(tta_probs, labels, sources, lo, hi, steps)
-            print(f"Tuned threshold (TTA):    {thresh_tta:.2f}  →  avg F1: {f1_tta_tuned:.4f}")
-
-        print_results(tta_probs, labels, sources, thresh_tta, label=f"TTA n={tta_n}")
+            # Independently tune per-center thresholds on TTA probabilities
+            per_center_tta = tune_thresholds_per_center(tta_probs, labels, sources, lo, hi, steps)
+            print(f"Per-center thresholds (TTA): { {c: f'{t:.2f} (F1={f:.4f})' for c, (t, f) in per_center_tta.items()} }")
+            thresh_dict_tta = {c: t for c, (t, _) in per_center_tta.items()}
+            print_results(tta_probs, labels, sources, thresh_dict_tta,
+                          label=f"TTA n={tta_n}", center_weights=center_weights)
 
 
 if __name__ == "__main__":

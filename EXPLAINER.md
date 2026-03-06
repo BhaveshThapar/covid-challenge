@@ -23,20 +23,36 @@
 
 ## How the Model Works (The "Brain")
 
-Think of it as **a doctor who starts by only studying one X-ray slice at a time, then gradually learns to use their full expertise on the whole scan:**
+Think of it as **a doctor who studies a whole patient chart at once, paying more attention to the most suspicious pages:**
 
-### The Backbone — `DenseNet-121`
-- A well-known image recognition network, but ours starts with weights from **RadImageNet** — a version pretrained specifically on **medical imaging** (X-rays, MRIs, CT scans), not just everyday photos
-- This gives it a head-start at recognising the kinds of patterns that appear in medical images
-- It turns each 224×224 photo into **1,024 numbers** that describe what it sees
+### Step 1 — Preprocessing: Find the Lungs First
+- Before the model sees anything, each CT slice goes through a **lung ROI crop**: we use OpenCV to threshold the image, find the two biggest bright regions (the two lungs), draw a bounding box around them with some padding, and crop to that box
+- This removes irrelevant background (bed, bones, air) and gives the model a tighter view of the actual lung tissue
+- The crop is resized to 224×224 for the model
 
-### How We Get a Scan-Level Decision
-- We pass all the slices from one scan through the network individually
-- Each slice gets a probability: "how likely is this slice from a Covid patient?"
-- We **average these probabilities** across all slices to get one number per scan
-- If that number is above a tuned threshold → **Covid**; otherwise → **Not Covid**
+### Step 2 — The Backbone — `DenseNet-121`
+- A well-known image recognition network pretrained on **RadImageNet** — a dataset of medical images (X-rays, MRIs, CT scans), not everyday photos
+- This gives it a head-start at recognising medical patterns
+- It turns each 224×224 slice into **1,024 numbers** (a feature vector)
+- During training, **MixStyle** is applied after the first two dense blocks: it randomly mixes the feature statistics (mean and variance) between scans from different hospitals, forcing the network to learn features that generalise across hospital scanners
+
+### Step 3 — Attention MIL: Deciding Which Slices Matter
+- All 64 slices from one scan are processed together as a **bag**
+- A small attention network (2 layers) assigns each slice a weight: "how informative is this slice for the diagnosis?"
+- The 1,024-d feature vectors are averaged using those weights → one **1,024-d scan embedding** that emphasises the most suspicious slices
+- A final classifier layer turns that into one Covid/Non-Covid logit per scan
+
+### Step 4 — Per-Center Threshold
+- After training, the threshold (the cutoff between Covid and Not Covid) is tuned **independently for each of the 4 hospitals** by sweeping 0.30–0.70 in 0.01 steps
+- This accounts for differences in how each hospital's scanner affects the probability distribution
 
 ---
+
+## How Data Is Sampled
+
+**During training (scan-level MIL):** Each dataset item is a whole scan. 64 slices are sampled uniformly from the scan, preprocessed with the ROI crop, and stacked into a bag of shape `(64, 3, 224, 224)`. Batches of 8 scans are assembled using `CenterBatchSampler` at the scan level, ensuring representation from all 4 hospitals in every batch. A boolean mask is produced so the model's attention layer can ignore any padding positions.
+
+**During validation (scan-level MIL):** 48 slices per scan, same ROI crop and MIL forward — the model directly outputs one scan-level logit via attention pooling. No post-hoc averaging is needed.
 
 ## How We Teach It (Training)
 
@@ -54,11 +70,12 @@ Teaching happens in **3 stages** — think of it like gradually handing a studen
 - The scheduler restarts every 5 epochs (cosine annealing with warm restarts)
 
 ### Stage 2b — Unfreeze One Block Deeper (15 epochs)
-- We additionally unfreeze `denseblock3`, at an even slower rate (lr=5e-5)
-- The optimizer is reinitialised fresh to give each sub-phase a clean start
-- The best checkpoint across all stages is saved as `checkpoints/best.pt`
+- We additionally unfreeze `denseblock3`, at an even slower rate (lr=3e-5)
+- The optimizer is reinitialised fresh from the best Stage 2a checkpoint
+- The best checkpoint across all stages is saved as `checkpoints/v3_ovr_best.pt`
+- If a job is killed between Stage 2a and 2b, `--phase 3` resumes from the saved Stage 2a checkpoint
 
-After each epoch we check how well it does on the validation patients (using scan-level F1). We save the best version automatically and stop early if there's no improvement for 10 epochs.
+After each epoch we evaluate on the validation scans (scan-level MIL forward, 48 slices per scan) and compute the **weighted F1** = (F1₀ + F1₁ + 0.2·F1₂ + F1₃) / 3.2 — this down-weights Centre 2 which is smallest and noisiest. Checkpoints are saved when weighted F1 improves; training stops early after 10 epochs without improvement.
 
 ---
 
@@ -70,9 +87,10 @@ After each epoch we check how well it does on the validation patients (using sca
 - A score of `1.0` = perfect, `0.0` = completely wrong
 
 ### Extra tricks at evaluation time:
-- **Threshold tuning**: instead of always saying "≥0.5 → Covid", we sweep thresholds from 0.30 to 0.70 and pick whichever gives the best F1 on the validation set
-- **Test-time augmentation (TTA)**: for each scan, we process its slices 4 ways (original, flipped, rotated +15°, rotated -15°) and average the predictions — this usually adds 1–3% F1 for free
-- **Independent threshold re-sweep after TTA**: TTA shifts the probability distribution toward 0.5, so the optimal threshold changes — we re-sweep after TTA separately
+- **Per-center threshold tuning**: instead of one global cutoff, we sweep 0.30–0.70 independently for each of the 4 hospitals and pick the best threshold per hospital
+- **Intensity TTA**: for each scan, we run the MIL forward 4 times with different intensity transformations (original, gamma=0.9, gamma=1.1, CLAHE contrast enhancement) and average the 4 probabilities — no geometric augmentation is used, avoiding artificial reorientation of lung anatomy
+- **Independent threshold re-sweep after TTA**: TTA shifts probabilities, so the optimal per-center thresholds are re-tuned on the TTA probabilities separately
+- **Dual F1 reporting**: the strict challenge formula always computes F1 over both classes 0 and 1. The sklearn "legacy" score (only classes present in the data) is also shown for comparison.
 
 ---
 
@@ -83,9 +101,7 @@ After each epoch we check how well it does on the validation patients (using sca
 - We submit **SLURM jobs** — basically notes that say "please run this program when a GPU is free"
 - Two jobs:
   1. **Extract job** (`tron` partition — stable, no preemption) — download from Google Drive + unpack all the zip/rar files onto the server
-  2. **Train job** (`tron` partition, `--qos=medium`) — train the model across all 3 stages on a newer GPU
-
-> **Why tron and not scavenger?** Scavenger jobs can be preempted (interrupted mid-run) by higher-priority users. Tron jobs run to completion. The `medium` QoS is needed to get 8 CPU workers and 64 GB RAM.
+  2. **Train job** (`tron` partition, `--qos=hi`, RTX A6000) — train the model across all 3 phases
 
 ---
 
@@ -93,11 +109,11 @@ After each epoch we check how well it does on the validation patients (using sca
 
 | File | What it does |
 |------|-------------|
-| `src/model.py` | Defines the "brain" — DenseNet-121 with RadImageNet weights, plus freeze/unfreeze helpers |
-| `src/dataset.py` | Teaches Python how to load CT slices, apply augmentations, and ensure batches have all 4 hospitals represented equally. Also detects missing/empty scan directories at startup. |
-| `src/train.py` | Runs all 3 training stages with learning rate schedules, gradient clipping, and label smoothing |
-| `src/evaluate.py` | Tests the trained model: scans are evaluated by averaging their slice predictions, then threshold tuning and TTA are applied |
-| `src/utils.py` | Helper tools (saving models with rotation-safe named checkpoints, computing per-hospital scores, stopping early if not improving) |
+| `src/model.py` | `DenseNetMILClassifier`: DenseNet-121 backbone + MixStyle + ABMIL attention head. `DenseNetCovidClassifier` kept for backward compatibility with v1/v2 checkpoints. |
+| `src/dataset.py` | Lung ROI crop (`_load_image_with_roi`), `ScanDataset` for MIL bag loading, intensity-only augmentations and TTA, `CenterBatchSampler` (scan-level), `build_scan_train_dataloader`. |
+| `src/train.py` | Scan-level MIL training: per-sample BCE with asymmetric center weights, weighted F1 checkpoint selection, all 3 phases. |
+| `src/evaluate.py` | MIL inference, intensity TTA, `tune_thresholds_per_center` (4 independent thresholds), `print_results` with weighted F1 display. |
+| `src/utils.py` | `compute_weighted_f1`, rotation-safe checkpointing, per-hospital F1, early stopping. |
 | `scripts/download_and_extract.py` | Downloads data from Google Drive and organises it into the right folder structure |
 | `slurm/train.sbatch` | The "note" we hand to the supercomputer to train the model |
 | `slurm/extract.sbatch` | The "note" to download and unpack the data |
@@ -111,16 +127,19 @@ After each epoch we check how well it does on the validation patients (using sca
 Google Drive archives
         ↓  gdown + unpack (extract.sbatch)
 Organised folders (data/train/, data/val/)
-        ↓  Load slices, augment, centre-balanced batches
-CT Slice Images (224×224 pixels)
-        ↓  DenseNet-121 (RadImageNet pretrained)
-Per-slice probability: P(non-covid)
-        ↓  Average across all slices in a scan
-Scan-level probability
-        ↓  Tuned threshold (swept 0.30–0.70)
+        ↓  Build scan manifest from metadata CSVs
+        ↓  ScanDataset: sample 64 slices per scan
+        ↓  ROI crop each slice (Otsu + connected components → lung bounding box → 224×224)
+        ↓  Intensity augmentations (train) / normalise (val)
+        ↓  CenterBatchSampler: 8 scans per batch, all 4 hospitals represented
+        ↓  DenseNet-121 (RadImageNet, +MixStyle) → 1024-d per-slice embedding
+        ↓  ABMIL attention → weighted sum → 1024-d scan embedding
+        ↓  Linear(1024→1) → scan-level logit
+        ↓  Sigmoid + per-center threshold (tuned 0.30–0.70)
 Covid / Non-Covid prediction
         ↓  Compare to ground truth, per hospital
-Per-hospital F1 score → Average = Final Score (P)
+Per-hospital F1 score → Plain average = Final Challenge Score (P)
+                      → Weighted average = Checkpoint selection metric
 ```
 
 ---

@@ -11,6 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -32,26 +33,21 @@ RADIMAGENET_STD  = [0.229, 0.224, 0.225]
 
 def get_train_transforms(image_size: int = 224):
     """
-    Training transforms: resize to 256, random crop to image_size, augmentations, normalize.
-    Augmentations applied before crop to avoid black border artifacts from rotation.
+    Training transforms: intensity-only augmentations (no geometric ops).
+    Input is already image_size×image_size from _load_image_with_roi — no Resize/Crop needed.
     """
     return A.Compose([
-        A.Resize(256, 256),
-        A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=15, p=0.5),
-        A.RandomCrop(image_size, image_size),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.GaussianBlur(blur_limit=(3, 7), p=0.1),
+        A.RandomGamma(gamma_limit=(85, 115), p=0.5),
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+        A.GaussNoise(var_limit=(6.5, 6.5), mean=0, p=0.2),  # σ≈0.01 in [0,1] → var≈6.5 uint8
         A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD),
         ToTensorV2(),
     ])
 
 
 def get_val_transforms(image_size: int = 224):
-    """Validation transforms: resize to 256, center crop to image_size, normalize."""
+    """Validation transforms: normalize only. ROI crop already outputs image_size×image_size."""
     return A.Compose([
-        A.Resize(256, 256),
-        A.CenterCrop(image_size, image_size),
         A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD),
         ToTensorV2(),
     ])
@@ -59,24 +55,18 @@ def get_val_transforms(image_size: int = 224):
 
 def get_tta_transforms(image_size: int = 224) -> list:
     """
-    Returns 4 augmentation pipelines for test-time augmentation (TTA).
-    Augmentation is applied BEFORE CenterCrop to avoid black border artifacts.
+    Returns 4 deterministic intensity TTA pipelines (no geometric augmentation).
+    Input is already image_size×image_size from _load_image_with_roi.
 
-    Pipelines: [identity, horizontal flip, rotate +15°, rotate -15°]
+    Pipelines: [identity, γ=0.9, γ=1.1, CLAHE]
     """
-    base = [A.Resize(256, 256)]
-    crop_norm = [
-        A.CenterCrop(image_size, image_size),
-        A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD),
-        ToTensorV2(),
+    norm = [A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD), ToTensorV2()]
+    return [
+        A.Compose(norm),                                                             # identity
+        A.Compose([A.RandomGamma(gamma_limit=(90, 90),   p=1.0)] + norm),           # γ=0.9
+        A.Compose([A.RandomGamma(gamma_limit=(110, 110), p=1.0)] + norm),           # γ=1.1
+        A.Compose([A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0)] + norm),  # CLAHE
     ]
-    augmentations = [
-        [],                                      # identity
-        [A.HorizontalFlip(p=1.0)],               # horizontal flip
-        [A.Rotate(limit=(15, 15), p=1.0)],       # rotate +15°
-        [A.Rotate(limit=(-15, -15), p=1.0)],     # rotate -15°
-    ]
-    return [A.Compose(base + aug + crop_norm) for aug in augmentations]
 
 
 # ---------- Helpers ---------- #
@@ -85,6 +75,61 @@ def _load_image(path: str) -> np.ndarray:
     """Load a JPEG slice and convert to RGB numpy array."""
     img = Image.open(path).convert("RGB")
     return np.array(img)
+
+
+def _center_crop_resize(img_rgb: np.ndarray, target_size: int) -> np.ndarray:
+    """Square center-crop then resize to target_size×target_size (ROI fallback)."""
+    H, W = img_rgb.shape[:2]
+    side = min(H, W)
+    y0, x0 = (H - side) // 2, (W - side) // 2
+    crop = img_rgb[y0:y0 + side, x0:x0 + side]
+    return cv2.resize(crop, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+
+
+def _load_image_with_roi(path: str, target_size: int = 224) -> np.ndarray:
+    """
+    Load a CT slice and apply lung ROI heuristic crop:
+      1. Grayscale + Otsu threshold → binary mask
+      2. Morphological closing (15×15 ellipse) to fill holes
+      3. Find connected components; keep 2 largest with area > 1% of image
+      4. Union bounding box of those 2 components, padded 15% on all sides
+      5. Crop original RGB to padded bounding box, resize to target_size×target_size
+
+    Fallback: center-crop if fewer than 2 valid components found.
+    Returns RGB uint8 numpy array of shape (target_size, target_size, 3).
+    """
+    img_rgb = np.array(Image.open(path).convert("RGB"))
+    H, W = img_rgb.shape[:2]
+
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    min_area = 0.01 * H * W
+    valid = sorted(
+        [(stats[i, cv2.CC_STAT_AREA], i)
+         for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] >= min_area],
+        reverse=True,
+    )
+
+    if len(valid) < 2:
+        return _center_crop_resize(img_rgb, target_size)   # fallback
+
+    top2 = [i for _, i in valid[:2]]
+    x1 = min(stats[i, cv2.CC_STAT_LEFT]                            for i in top2)
+    y1 = min(stats[i, cv2.CC_STAT_TOP]                             for i in top2)
+    x2 = max(stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH]  for i in top2)
+    y2 = max(stats[i, cv2.CC_STAT_TOP]  + stats[i, cv2.CC_STAT_HEIGHT] for i in top2)
+
+    px, py = int(0.15 * (x2 - x1)), int(0.15 * (y2 - y1))
+    x1 = max(0, x1 - px);  y1 = max(0, y1 - py)
+    x2 = min(W, x2 + px);  y2 = min(H, y2 + py)
+
+    crop = img_rgb[y1:y2, x1:x2]
+    return cv2.resize(crop, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
 
 
 def _get_sorted_slices(scan_dir: str) -> list:
@@ -277,10 +322,10 @@ class ScanDataset(Dataset):
         else:
             selected = all_slices
 
-        # Load and transform
+        # Load with ROI crop and transform
         images = []
         for path in selected:
-            img = _load_image(path)
+            img = _load_image_with_roi(path)
             if self.transform:
                 img = self.transform(image=img)["image"]
             images.append(img)
@@ -316,7 +361,7 @@ class RawSliceScanDataset(Dataset):
         else:
             selected = all_slices
 
-        raw_imgs = [_load_image(p) for p in selected]
+        raw_imgs = [_load_image_with_roi(p) for p in selected]
         return raw_imgs, entry["label"], entry["source"]
 
 
@@ -400,7 +445,7 @@ class CenterBatchSampler(Sampler):
 
 def build_slice_dataloaders(data_dir: str, metadata_dir: str, config: dict):
     """
-    Build train & val dataloaders for slice-level training.
+    Build train & val dataloaders for slice-level training (v1/v2 — kept for backward compat).
 
     Training: CenterBatchSampler ensures center-balanced batches.
     Validation: ScanDataset with scan-level collation (used in evaluate_scans helper).
@@ -422,6 +467,40 @@ def build_slice_dataloaders(data_dir: str, metadata_dir: str, config: dict):
         batch_sampler=batch_sampler,
         num_workers=config["data"]["num_workers"],
         pin_memory=config["data"]["pin_memory"],
+    )
+    return train_loader, val_entries
+
+
+def build_scan_train_dataloader(data_dir: str, metadata_dir: str, config: dict):
+    """
+    Build scan-level DataLoader for MIL training (v3).
+
+    Each training sample is one scan (bag of K=slices_per_scan slices).
+    CenterBatchSampler operates at scan level (not slice level).
+    scan_collate_fn yields 4-tuples: (images, labels, sources, masks).
+
+    Returns: (train_loader, val_entries)
+    """
+    train_entries = build_scan_manifest(data_dir, "train", metadata_dir)
+    val_entries   = build_scan_manifest(data_dir,   "val", metadata_dir)
+
+    img_size = config["data"]["image_size"]
+    train_ds = ScanDataset(
+        train_entries,
+        get_train_transforms(img_size),
+        slices_per_scan=config["data"]["slices_per_scan"],   # K=64
+    )
+
+    # CenterBatchSampler accepts any source list — reuse at scan level
+    scan_sources  = [entry["source"] for entry in train_entries]
+    batch_sampler = CenterBatchSampler(scan_sources, config["phase1"]["batch_size"])
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=batch_sampler,
+        num_workers=config["data"]["num_workers"],
+        pin_memory=config["data"]["pin_memory"],
+        collate_fn=scan_collate_fn,    # returns (images:(B,K,3,H,W), labels, sources, masks)
     )
     return train_loader, val_entries
 
