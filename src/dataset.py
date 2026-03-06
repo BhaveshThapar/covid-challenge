@@ -39,7 +39,7 @@ def get_train_transforms(image_size: int = 224):
     return A.Compose([
         A.RandomGamma(gamma_limit=(85, 115), p=0.5),
         A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
-        A.GaussNoise(var_limit=(6.5, 6.5), mean=0, p=0.2),  # σ≈0.01 in [0,1] → var≈6.5 uint8
+        A.GaussNoise(std_range=(0.01, 0.01), p=0.2),  # albumentations ≥2.0 API; σ=0.01 in [0,1]
         A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD),
         ToTensorV2(),
     ])
