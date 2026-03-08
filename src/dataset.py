@@ -352,48 +352,66 @@ def scan_collate_fn(batch):
 
 class CenterBatchSampler(Sampler):
     """
-    Yields batches where each medical center (0-3) contributes roughly equally.
-    Smaller centers are resampled with replacement to match the largest center's
-    pool size each epoch — no data from any center is permanently discarded.
+    Yields batches where each medical center (0-3) contributes equally AND
+    each center's contribution is split equally between covid (label=0) and
+    non-covid (label=1) slices.
+
+    Per batch: (batch_size // n_centers // 2) slices per (center, class) group.
+    Minority (center, class) groups are oversampled with replacement each epoch.
 
     Usage:
         sources = [s[2] for s in train_ds.samples]
-        DataLoader(train_ds, batch_sampler=CenterBatchSampler(sources, batch_size=32))
+        labels  = [s[1] for s in train_ds.samples]
+        DataLoader(train_ds, batch_sampler=CenterBatchSampler(sources, labels, batch_size=32))
     """
 
-    def __init__(self, sources: list, batch_size: int):
+    def __init__(self, sources: list, labels: list, batch_size: int):
         self.pools_original: dict = defaultdict(list)
-        for i, s in enumerate(sources):
-            self.pools_original[s].append(i)
+        for i, (s, l) in enumerate(zip(sources, labels)):
+            self.pools_original[(s, l)].append(i)
         self.batch_size = batch_size
-        self.n_centers = len(self.pools_original)
+        self.centers = sorted({s for s in sources})
+        self.n_centers = len(self.centers)
+        self.label_vals = sorted({l for l in labels})
+        self.n_labels = len(self.label_vals)
         self.max_size = max(len(v) for v in self.pools_original.values())
 
     def __iter__(self):
-        # Oversample smaller centers (with replacement) to match largest
+        # Oversample each (center, label) pool to max_size
         pools = {}
-        for c, idxs in self.pools_original.items():
+        for key, idxs in self.pools_original.items():
             shuffled = list(idxs)
             random.shuffle(shuffled)
             while len(shuffled) < self.max_size:
                 extra = list(idxs)
                 random.shuffle(extra)
                 shuffled.extend(extra)
-            pools[c] = shuffled[:self.max_size]
+            pools[key] = shuffled[:self.max_size]
 
         per_center = max(1, self.batch_size // self.n_centers)
-        pos = {c: 0 for c in pools}
-        while all(pos[c] + per_center <= self.max_size for c in pools):
+        per_class = max(1, per_center // self.n_labels)
+        pos = {key: 0 for key in pools}
+
+        while all(
+            pos[(c, l)] + per_class <= self.max_size
+            for c in self.centers
+            for l in self.label_vals
+            if (c, l) in pools
+        ):
             batch = []
-            for c in sorted(pools):
-                batch.extend(pools[c][pos[c]: pos[c] + per_center])
-                pos[c] += per_center
+            for c in self.centers:
+                for l in self.label_vals:
+                    key = (c, l)
+                    if key in pools:
+                        batch.extend(pools[key][pos[key]: pos[key] + per_class])
+                        pos[key] += per_class
             random.shuffle(batch)
             yield batch
 
     def __len__(self):
         per_center = max(1, self.batch_size // self.n_centers)
-        return self.max_size // per_center
+        per_class = max(1, per_center // self.n_labels)
+        return self.max_size // per_class
 
 
 # ---------- DataLoader Builders ---------- #
@@ -415,7 +433,8 @@ def build_slice_dataloaders(data_dir: str, metadata_dir: str, config: dict):
     train_ds = SliceDataset(train_entries, get_train_transforms(img_size), max_slices)
 
     sources = [s[2] for s in train_ds.samples]
-    batch_sampler = CenterBatchSampler(sources, config["phase1"]["batch_size"])
+    labels  = [s[1] for s in train_ds.samples]
+    batch_sampler = CenterBatchSampler(sources, labels, config["phase1"]["batch_size"])
 
     train_loader = DataLoader(
         train_ds,
