@@ -2,7 +2,7 @@
 
 Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
 
-## Architecture (aadit-dev branch)
+## Architecture (aadit-dev-v4 branch)
 
 **DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation:**
 
@@ -13,7 +13,7 @@ CT Slices → DenseNet-121 (RadImageNet) → Average Slice Probs → Threshold �
 Training uses progressive backbone unfreezing rather than a separate MIL aggregation stage.
 Scan-level predictions simply average per-slice sigmoid probabilities (no learned attention).
 
-**Metric:** Average macro F1 across 4 data centres
+**Metric:** Average macro F1 across 4 data centres. Per-centre F1 is the macro average of per-class F1 scores for classes that have ground-truth samples in that centre (missing classes are skipped, not zeroed).
 
 ## Project Structure
 
@@ -89,29 +89,14 @@ datasets/               # metadata CSVs live here (alongside raw archives)
 
 ```bash
 # Submit full training job (Phase 1 → Phase 2 sequentially):
-sbatch slurm/train.sbatch
-
-# Or submit Phase 2 only (if phase1_best.pt already exists):
-BASH_ENV=/usr/share/Modules/init/bash sbatch \
-  --job-name=covid-phase2 \
-  --partition=tron --account=nexus --qos=medium \
-  --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=10:00:00 \
-  --output=logs/phase2_%j.out --error=logs/phase2_%j.err \
-  --wrap='cd /fs/nexus-scratch/aadit/covid-challenge &&
-          source /usr/share/Modules/init/bash &&
-          module load Python3/3.10.14 &&
-          source venv/bin/activate &&
-          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-          python -u src/train.py --config configs/default.yaml \
-            --data-dir data --metadata-dir datasets --phase 2'
+export BASH_ENV=/usr/share/Modules/init/bash && sbatch slurm/train.sbatch
 
 # Run directly (debug / local):
 python src/train.py --config configs/default.yaml --phase 0
 ```
 
-> **Partition:** Use `tron --qos=medium` (not `scavenger`) for training. Tron gives newer GPUs
-> (no preemption) and `--qos=medium` is required to get 8 CPUs + 64 GB RAM
-> (default QoS caps at 4 CPUs / 32 GB which is insufficient for `num_workers=8`).
+> **Partition:** `train.sbatch` targets `tron --qos=high --account=nexus` with an RTX A6000.
+> This avoids preemption and provides enough CPUs/RAM for `num_workers=8`.
 
 Training phases:
 - **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
@@ -163,7 +148,7 @@ Flags:
 | Phase 2b LR | 5e-5 (denseblock3) |
 | Loss | BCEWithLogitsLoss + label smoothing (ε=0.05) |
 | Grad clipping | max_norm=1.0 |
-| Batch sampler | Center-stratified (equal center representation) |
+| Batch sampler | Center + class balanced: equal covid & non-covid slices per centre per batch |
 | Threshold | Tuned on val (0.30–0.70 sweep) |
 | TTA | 4 augmentations (identity, hflip, rotate ±15°) |
 | Early stopping patience | 10 epochs |
@@ -197,5 +182,5 @@ sbatch slurm/train.sbatch
 
 - Python 3.10+
 - PyTorch 2.6+ + CUDA 11.8
-- SLURM cluster with GPU (tested on UMD Nexus, `tron` partition, qos=medium)
+- SLURM cluster with GPU (tested on UMD Nexus, `tron` partition, qos=high, RTX A6000)
 - `unrar` system module: `module load unrar/7.0.9`

@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=covid-train
-#SBATCH --partition=scavenger
-#SBATCH --qos=scavenger
-#SBATCH --account=scavenger
-#SBATCH --gres=gpu:1
+#SBATCH --partition=tron
+#SBATCH --qos=high
+#SBATCH --account=nexus
+#SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=12:00:00
@@ -14,8 +14,11 @@ set -e
 cd /fs/nexus-scratch/aadit/covid-challenge
 
 # Load environment
+export BASH_ENV=/usr/share/Modules/init/bash
+source /usr/share/Modules/init/bash
 module load Python3/3.10.14
 source venv/bin/activate
+unset BASH_ENV
 
 echo "=== Job Info ==="
 echo "Node: $(hostname)"
@@ -28,7 +31,7 @@ python src/train.py \
     --config configs/default.yaml \
     --data-dir data \
     --metadata-dir datasets \
-    --run-name v2 \
+    --run-name v4 \
     --phase 0
 
 echo "Training complete at $(date)"
@@ -36,7 +39,7 @@ echo "Training complete at $(date)"
 # Run evaluation
 python src/evaluate.py \
     --config configs/default.yaml \
-    --checkpoint checkpoints/v2_ovr_best.pt \
+    --checkpoint checkpoints/v4_ovr_best.pt \
     --data-dir data \
     --metadata-dir datasets
 
