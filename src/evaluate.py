@@ -172,8 +172,7 @@ def print_results(
     label: str = "",
 ):
     preds = (probs >= threshold).astype(int)
-    f1_dict = compute_per_source_f1(labels, preds, sources, strict_labels=True)
-    f1_legacy = compute_per_source_f1(labels, preds, sources, strict_labels=False)
+    f1_dict = compute_per_source_f1(labels, preds, sources)
 
     tag = f" [{label}]" if label else ""
     print(f"\n{'='*55}")
@@ -182,7 +181,6 @@ def print_results(
     for k, v in sorted(f1_dict.items()):
         marker = "  ★" if k == "average" else ""
         print(f"  {k:>12}: {v:.4f}{marker}")
-    print(f"  [sklearn legacy (classes in y_true∪y_pred)]: avg = {f1_legacy['average']:.4f}")
 
     print_confusion_matrices(labels, preds, sources)
 
