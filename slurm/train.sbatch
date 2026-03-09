@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=12:00:00
+#SBATCH --time=05:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 
@@ -31,7 +31,7 @@ python src/train.py \
     --config configs/default.yaml \
     --data-dir data \
     --metadata-dir datasets \
-    --run-name v4 \
+    --run-name v6 \
     --phase 0
 
 echo "Training complete at $(date)"
@@ -39,7 +39,7 @@ echo "Training complete at $(date)"
 # Run evaluation
 python src/evaluate.py \
     --config configs/default.yaml \
-    --checkpoint checkpoints/v4_ovr_best.pt \
+    --checkpoint checkpoints/v6_ovr_best.pt \
     --data-dir data \
     --metadata-dir datasets
 

@@ -2,7 +2,7 @@
 
 Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
 
-## Architecture (aadit-dev-v4 branch)
+## Architecture (aadit-dev-v6 branch)
 
 **DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation:**
 
@@ -150,7 +150,7 @@ Flags:
 | Grad clipping | max_norm=1.0 |
 | Batch sampler | Center + class balanced: equal covid & non-covid slices per centre per batch |
 | Threshold | Tuned on val (0.30–0.70 sweep) |
-| TTA | 4 augmentations (identity, hflip, rotate ±15°) |
+| TTA | 4 intensity augmentations (identity, γ=0.9, γ=1.1, CLAHE) |
 | Early stopping patience | 10 epochs |
 | AMP | bfloat16 on Ampere GPUs; falls back to float32 on Turing/Pascal |
 | Eval batch size | 1 scan at a time (prevents OOM on full-slice eval) |

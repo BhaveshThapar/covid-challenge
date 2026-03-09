@@ -32,16 +32,17 @@ RADIMAGENET_STD  = [0.229, 0.224, 0.225]
 
 def get_train_transforms(image_size: int = 224):
     """
-    Training transforms: resize to 256, random crop to image_size, augmentations, normalize.
-    Augmentations applied before crop to avoid black border artifacts from rotation.
+    Training transforms: resize to 256, random crop to image_size, intensity augmentations, normalize.
+    No geometric augmentations (no flip/rotate) — intensity-only to preserve anatomical orientation.
     """
     return A.Compose([
         A.Resize(256, 256),
-        A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=15, p=0.5),
         A.RandomCrop(image_size, image_size),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
         A.GaussianBlur(blur_limit=(3, 7), p=0.1),
+        A.RandomGamma(gamma_limit=(85, 115), p=0.5),
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+        A.GaussNoise(std_range=(0.01, 0.01), p=0.2),
         A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD),
         ToTensorV2(),
     ])
@@ -59,24 +60,19 @@ def get_val_transforms(image_size: int = 224):
 
 def get_tta_transforms(image_size: int = 224) -> list:
     """
-    Returns 4 augmentation pipelines for test-time augmentation (TTA).
-    Augmentation is applied BEFORE CenterCrop to avoid black border artifacts.
+    Returns 4 intensity augmentation pipelines for test-time augmentation (TTA).
+    No geometric variants — intensity-only to preserve anatomical orientation.
 
-    Pipelines: [identity, horizontal flip, rotate +15°, rotate -15°]
+    Pipelines: [identity, γ=0.9, γ=1.1, CLAHE]
     """
-    base = [A.Resize(256, 256)]
-    crop_norm = [
-        A.CenterCrop(image_size, image_size),
-        A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD),
-        ToTensorV2(),
+    base = [A.Resize(256, 256), A.CenterCrop(image_size, image_size)]
+    norm = [A.Normalize(mean=RADIMAGENET_MEAN, std=RADIMAGENET_STD), ToTensorV2()]
+    return [
+        A.Compose(base + norm),                                                              # identity
+        A.Compose(base + [A.RandomGamma(gamma_limit=(90, 90),   p=1.0)] + norm),            # γ=0.9
+        A.Compose(base + [A.RandomGamma(gamma_limit=(110, 110), p=1.0)] + norm),            # γ=1.1
+        A.Compose(base + [A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0)] + norm),  # CLAHE
     ]
-    augmentations = [
-        [],                                      # identity
-        [A.HorizontalFlip(p=1.0)],               # horizontal flip
-        [A.Rotate(limit=(15, 15), p=1.0)],       # rotate +15°
-        [A.Rotate(limit=(-15, -15), p=1.0)],     # rotate -15°
-    ]
-    return [A.Compose(base + aug + crop_norm) for aug in augmentations]
 
 
 # ---------- Helpers ---------- #
