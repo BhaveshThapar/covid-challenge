@@ -197,7 +197,15 @@ def print_results(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate DenseNet-121 Covid-19 Detector")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to single checkpoint. Required unless --ensemble is set.")
+    parser.add_argument("--ensemble", action="store_true",
+                        help="Ensemble K fold checkpoints instead of a single checkpoint. "
+                             "Looks for {run_name}_fold{0..n_folds-1}_ovr_best.pt")
+    parser.add_argument("--n-folds", type=int, default=None,
+                        help="Number of folds for ensemble (default: config kfold.n_splits)")
+    parser.add_argument("--run-name", type=str, default="run",
+                        help="Run name prefix for ensemble checkpoint discovery")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
     parser.add_argument("--split", type=str, default="val")
@@ -207,17 +215,14 @@ def main():
                         help="Use config threshold (default 0.5) instead of sweeping")
     args = parser.parse_args()
 
+    if not args.ensemble and args.checkpoint is None:
+        parser.error("--checkpoint is required unless --ensemble is set")
+
     config = load_config(args.config)
     set_seed(config["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = config.get("phase2", {}).get("use_amp", True)
 
-    # Model
-    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
-    epoch, score = CheckpointManager.load(args.checkpoint, model, device=device)
-    print(f"Loaded checkpoint from epoch {epoch}, training score={score:.4f}")
-
-    # Data
     val_entries = build_scan_manifest(args.data_dir, args.split, args.metadata_dir)
     print(f"Val scans: {len(val_entries)}")
 
@@ -226,6 +231,40 @@ def main():
     hi = eval_cfg.get("threshold_hi", 0.7)
     steps = eval_cfg.get("threshold_steps", 41)
     tta_n = 0 if args.no_tta else eval_cfg.get("tta_n", 4)
+
+    # ---- Ensemble mode: average probs from K fold checkpoints ----
+    if args.ensemble:
+        n_folds = args.n_folds or config.get("kfold", {}).get("n_splits", 5)
+        ckpt_dir = config.get("checkpoint_dir", "checkpoints")
+        print(f"\n--- Ensemble mode: loading {n_folds} fold checkpoints...")
+
+        all_probs, labels, sources = [], None, None
+        for fold in range(n_folds):
+            ckpt_path = os.path.join(ckpt_dir, f"{args.run_name}_fold{fold}_ovr_best.pt")
+            model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+            epoch, score = CheckpointManager.load(ckpt_path, model, device=device)
+            print(f"  Fold {fold}: epoch={epoch}, train_score={score:.4f}")
+            probs, lab, src = collect_scan_probs(model, val_entries, config, device, use_amp)
+            all_probs.append(probs)
+            if labels is None:
+                labels, sources = lab, src
+
+        probs = np.mean(all_probs, axis=0)
+        print(f"Ensemble of {n_folds} models — probabilities averaged.")
+
+        if args.no_tune_threshold:
+            thresh = eval_cfg.get("threshold", 0.5)
+        else:
+            thresh, f1_tuned = tune_threshold(probs, labels, sources, lo, hi, steps)
+            print(f"Tuned threshold (ensemble): {thresh:.2f}  →  avg F1: {f1_tuned:.4f}")
+
+        print_results(probs, labels, sources, thresh, label=f"Ensemble n={n_folds}")
+        return
+
+    # ---- Single checkpoint mode ----
+    model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    epoch, score = CheckpointManager.load(args.checkpoint, model, device=device)
+    print(f"Loaded checkpoint from epoch {epoch}, training score={score:.4f}")
 
     # ---- Step 1: Inference without TTA ----
     print("\n--- Running inference (no TTA)...")
@@ -245,7 +284,6 @@ def main():
         print(f"\n--- Running TTA inference (n={tta_n})...")
         tta_probs, _, _ = collect_scan_probs_tta(model, val_entries, config, device, tta_n, use_amp)
 
-        # Independently tune threshold on TTA probabilities (distribution differs from no-TTA)
         if args.no_tune_threshold:
             thresh_tta = eval_cfg.get("threshold", 0.5)
         else:

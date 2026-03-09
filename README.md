@@ -2,7 +2,7 @@
 
 Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
 
-## Architecture (aadit-dev-v4 branch)
+## Architecture (aadit-dev-v5 branch)
 
 **DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation:**
 
@@ -88,22 +88,31 @@ datasets/               # metadata CSVs live here (alongside raw archives)
 ## Training
 
 ```bash
-# Submit full training job (Phase 1 → Phase 2 sequentially):
+# Submit 3-fold CV training + ensemble eval:
 export BASH_ENV=/usr/share/Modules/init/bash && sbatch slurm/train.sbatch
 
-# Run directly (debug / local):
-python src/train.py --config configs/default.yaml --phase 0
+# Run single-model training (no k-fold, for debugging):
+python src/train.py --config configs/default.yaml --phase 0 --run-name v5_single
+
+# Run ensemble evaluation manually (after all folds complete):
+python src/evaluate.py --config configs/default.yaml --ensemble --run-name v5 \
+    --data-dir data --metadata-dir datasets
 ```
 
 > **Partition:** `train.sbatch` targets `tron --qos=high --account=nexus` with an RTX A6000.
 > This avoids preemption and provides enough CPUs/RAM for `num_workers=8`.
 
-Training phases:
+Training (k-fold, `--phase 4`):
+- Folds the **training set** into K=3 stratified folds (stratified by centre × class)
+- Each fold trains a full Phase 1 → 2a → 2b model, validated on its held-out fold
+- After all folds: ensemble probabilities averaged → threshold tuned → final F1 reported
+
+Per-fold phases:
 - **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
 - **Phase 2a** (epochs 1–15): Unfreeze `denseblock4+norm5`, lr=1e-4
 - **Phase 2b** (epochs 1–15): Unfreeze `denseblock3+transition3`, lr=5e-5
 
-Checkpoints: `checkpoints/phase1_best.pt`, `checkpoints/phase2a_best.pt`, `checkpoints/phase2b_best.pt`, `checkpoints/best.pt`
+Checkpoints per fold: `checkpoints/v5_fold{k}_phase1_best.pt`, `v5_fold{k}_phase2a_best.pt`, `v5_fold{k}_phase2b_best.pt`, `v5_fold{k}_ovr_best.pt`
 
 ## Evaluation
 

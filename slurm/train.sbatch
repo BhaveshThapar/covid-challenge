@@ -31,15 +31,16 @@ python src/train.py \
     --config configs/default.yaml \
     --data-dir data \
     --metadata-dir datasets \
-    --run-name v4 \
-    --phase 0
+    --run-name v5 \
+    --phase 4
 
 echo "Training complete at $(date)"
 
-# Run evaluation
+# Run ensemble evaluation
 python src/evaluate.py \
     --config configs/default.yaml \
-    --checkpoint checkpoints/v4_ovr_best.pt \
+    --ensemble \
+    --run-name v5 \
     --data-dir data \
     --metadata-dir datasets
 

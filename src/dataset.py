@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from PIL import Image
+from sklearn.model_selection import StratifiedKFold
 
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -414,34 +415,65 @@ class CenterBatchSampler(Sampler):
         return self.max_size // per_class
 
 
+# ---------- K-Fold Split ---------- #
+
+def kfold_scan_splits(scan_entries: list, n_splits: int = 5, seed: int = 42):
+    """
+    Split scan_entries into K stratified folds at the scan level (no slice leakage).
+    Stratified by (source, label) to maintain center and class balance across folds.
+
+    Yields:
+        (train_entries, val_entries) for each fold
+    """
+    strat_labels = [f"{e['source']}_{e['label']}" for e in scan_entries]
+    indices = np.arange(len(scan_entries))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for train_idx, val_idx in skf.split(indices, strat_labels):
+        yield (
+            [scan_entries[i] for i in train_idx],
+            [scan_entries[i] for i in val_idx],
+        )
+
+
 # ---------- DataLoader Builders ---------- #
 
-def build_slice_dataloaders(data_dir: str, metadata_dir: str, config: dict):
-    """
-    Build train & val dataloaders for slice-level training.
-
-    Training: CenterBatchSampler ensures center-balanced batches.
-    Validation: ScanDataset with scan-level collation (used in evaluate_scans helper).
-    Returns: (train_loader, val_entries) — val_entries used directly by evaluate_scans()
-    """
-    train_entries = build_scan_manifest(data_dir, "train", metadata_dir)
-    val_entries = build_scan_manifest(data_dir, "val", metadata_dir)
-
+def _build_train_loader(train_entries: list, config: dict):
+    """Build a center+class balanced training DataLoader from scan entries."""
     img_size = config["data"]["image_size"]
-    max_slices = config["data"]["slices_per_scan"]  # per scan cap during training
-
+    max_slices = config["data"]["slices_per_scan"]
     train_ds = SliceDataset(train_entries, get_train_transforms(img_size), max_slices)
-
     sources = [s[2] for s in train_ds.samples]
     labels  = [s[1] for s in train_ds.samples]
     batch_sampler = CenterBatchSampler(sources, labels, config["phase1"]["batch_size"])
-
-    train_loader = DataLoader(
+    return DataLoader(
         train_ds,
         batch_sampler=batch_sampler,
         num_workers=config["data"]["num_workers"],
         pin_memory=config["data"]["pin_memory"],
     )
-    return train_loader, val_entries
+
+
+def build_slice_dataloaders(
+    data_dir: str,
+    metadata_dir: str,
+    config: dict,
+    train_entries: list = None,
+    val_entries: list = None,
+):
+    """
+    Build train DataLoader and return val scan entries for slice-level training.
+
+    Args:
+        train_entries: Pre-split scan entries to train on. If None, loads all training scans.
+        val_entries:   Pre-split scan entries to validate on. If None, loads challenge val set.
+
+    Returns:
+        (train_loader, val_entries)
+    """
+    if train_entries is None:
+        train_entries = build_scan_manifest(data_dir, "train", metadata_dir)
+    if val_entries is None:
+        val_entries = build_scan_manifest(data_dir, "val", metadata_dir)
+    return _build_train_loader(train_entries, config), val_entries
 
 

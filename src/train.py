@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.model import DenseNetCovidClassifier
 from src.dataset import (
-    build_slice_dataloaders, build_scan_manifest,
+    build_slice_dataloaders, build_scan_manifest, kfold_scan_splits,
     ScanDataset, get_val_transforms, scan_collate_fn,
 )
 from src.utils import (
@@ -173,12 +173,18 @@ def _log_f1(f1_dict: dict, writer: SummaryWriter, epoch: int, logger, prefix: st
 # Phase 1: Frozen backbone, head-only
 # ---------------------------------------------------------------------------
 
-def train_phase1(config: dict, data_dir: str, metadata_dir: str, device, logger) -> DenseNetCovidClassifier:
+def train_phase1(
+    config: dict, data_dir: str, metadata_dir: str, device, logger,
+    train_entries: list = None, fold_val_entries: list = None,
+) -> DenseNetCovidClassifier:
     logger.info("=" * 60)
     logger.info("PHASE 1: Frozen Backbone — Head-Only Fine-Tuning")
     logger.info("=" * 60)
 
-    train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
+    train_loader, val_entries = build_slice_dataloaders(
+        data_dir, metadata_dir, config,
+        train_entries=train_entries, val_entries=fold_val_entries,
+    )
     logger.info(f"Train slices: {len(train_loader.dataset)}, Val scans: {len(val_entries)}")
 
     # Model — load RadImageNet weights, freeze backbone
@@ -334,12 +340,16 @@ def _run_subphase(
 def train_phase2(
     config: dict, data_dir: str, metadata_dir: str, device, logger,
     phase1_model: DenseNetCovidClassifier = None,
+    train_entries: list = None, fold_val_entries: list = None,
 ) -> DenseNetCovidClassifier:
     logger.info("=" * 60)
     logger.info("PHASE 2: Gradual Backbone Unfreezing")
     logger.info("=" * 60)
 
-    train_loader, val_entries = build_slice_dataloaders(data_dir, metadata_dir, config)
+    train_loader, val_entries = build_slice_dataloaders(
+        data_dir, metadata_dir, config,
+        train_entries=train_entries, val_entries=fold_val_entries,
+    )
 
     # Load Phase 1 checkpoint if model not passed in
     if phase1_model is None:
@@ -486,6 +496,127 @@ def train_phase2b_only(
 
 
 # ---------------------------------------------------------------------------
+# K-Fold cross-validation
+# ---------------------------------------------------------------------------
+
+def run_kfold(config: dict, data_dir: str, metadata_dir: str, device, logger) -> None:
+    """
+    Train K models on stratified folds of the training set, then ensemble on the challenge val set.
+
+    Each fold:
+      - Trains on (K-1)/K of training scans (early stopping against the held-out fold)
+      - Saves best checkpoint as {run_name}_fold{k}_ovr_best.pt
+
+    After all folds:
+      - Loads each fold's best checkpoint
+      - Averages raw sigmoid probabilities over all K models
+      - Tunes threshold on ensemble probabilities
+      - Reports final ensemble F1
+      - Saves ensemble probs/labels/sources as .npy for later analysis
+    """
+    n_splits = config.get("kfold", {}).get("n_splits", 5)
+    all_train_entries = build_scan_manifest(data_dir, "train", metadata_dir)
+    challenge_val_entries = build_scan_manifest(data_dir, "val", metadata_dir)
+
+    logger.info(f"K-Fold CV: {n_splits} folds, {len(all_train_entries)} total training scans")
+
+    base_run_name = config["run_name"]
+
+    for fold, (train_ent, fold_val_ent) in enumerate(
+        kfold_scan_splits(all_train_entries, n_splits, config["seed"])
+    ):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"FOLD {fold + 1}/{n_splits}  —  "
+                    f"train: {len(train_ent)} scans, held-out val: {len(fold_val_ent)} scans")
+        logger.info(f"{'='*60}")
+
+        fold_config = dict(config)
+        fold_config["run_name"] = f"{base_run_name}_fold{fold}"
+
+        model = train_phase1(
+            fold_config, data_dir, metadata_dir, device, logger,
+            train_entries=train_ent, fold_val_entries=fold_val_ent,
+        )
+        train_phase2(
+            fold_config, data_dir, metadata_dir, device, logger,
+            phase1_model=model,
+            train_entries=train_ent, fold_val_entries=fold_val_ent,
+        )
+
+    # ---- Ensemble evaluation on challenge val set ----
+    logger.info(f"\n{'='*60}")
+    logger.info("ENSEMBLE EVALUATION on challenge val set")
+    logger.info(f"{'='*60}")
+
+    img_size = config["data"]["image_size"]
+    val_ds = ScanDataset(challenge_val_entries, get_val_transforms(img_size), slices_per_scan=-1)
+    val_loader = DataLoader(
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=config["data"]["num_workers"],
+        pin_memory=config["data"]["pin_memory"],
+        collate_fn=scan_collate_fn,
+    )
+
+    all_fold_probs = []
+    labels_arr, sources_arr = None, None
+
+    for fold in range(n_splits):
+        fold_rn = f"{base_run_name}_fold{fold}"
+        ckpt_path = os.path.join(config["checkpoint_dir"], f"{fold_rn}_ovr_best.pt")
+        model = DenseNetCovidClassifier(dropout=config["model"]["dropout"]).to(device)
+        CheckpointManager.load(ckpt_path, model, device=device)
+        model.eval()
+
+        probs_list, labels_list, sources_list = [], [], []
+        with torch.no_grad():
+            for images, labels, sources, masks in val_loader:
+                B, K, C, H, W = images.shape
+                x_flat = images.view(B * K, C, H, W).to(device)
+                logits = model(x_flat).squeeze(-1)
+                probs = torch.sigmoid(logits).view(B, K)
+                valid = masks.float().to(device)
+                scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)
+                probs_list.extend(scan_probs.cpu().numpy())
+                labels_list.extend(labels.numpy())
+                sources_list.extend(sources.numpy())
+
+        fold_probs = np.array(probs_list)
+        all_fold_probs.append(fold_probs)
+        if labels_arr is None:
+            labels_arr = np.array(labels_list)
+            sources_arr = np.array(sources_list)
+
+        # Log individual fold score at default threshold
+        fold_preds = (fold_probs >= 0.5).astype(int)
+        fold_f1 = compute_per_source_f1(labels_arr, fold_preds, sources_arr)
+        logger.info(f"Fold {fold} (t=0.5): avg F1={fold_f1['average']:.4f}")
+
+    ensemble_probs = np.mean(all_fold_probs, axis=0)
+
+    # Tune threshold on ensemble probabilities
+    eval_cfg = config["eval"]
+    lo, hi, steps = eval_cfg.get("threshold_lo", 0.3), eval_cfg.get("threshold_hi", 0.7), eval_cfg.get("threshold_steps", 41)
+    best_t, best_f1 = 0.5, 0.0
+    for t in np.linspace(lo, hi, steps):
+        preds = (ensemble_probs >= t).astype(int)
+        f1 = compute_per_source_f1(labels_arr, preds, sources_arr)["average"]
+        if f1 > best_f1:
+            best_t, best_f1 = float(t), f1
+
+    logger.info(f"Ensemble F1 (tuned t={best_t:.2f}): {best_f1:.4f}")
+    f1_dict = compute_per_source_f1(labels_arr, (ensemble_probs >= best_t).astype(int), sources_arr)
+    for k, v in sorted(f1_dict.items()):
+        logger.info(f"  {k}: {v:.4f}")
+
+    # Save ensemble artifacts
+    ckpt_dir = config["checkpoint_dir"]
+    np.save(os.path.join(ckpt_dir, f"{base_run_name}_ensemble_probs.npy"), ensemble_probs)
+    np.save(os.path.join(ckpt_dir, f"{base_run_name}_ensemble_labels.npy"), labels_arr)
+    np.save(os.path.join(ckpt_dir, f"{base_run_name}_ensemble_sources.npy"), sources_arr)
+    logger.info(f"Saved ensemble artifacts to {ckpt_dir}/{base_run_name}_ensemble_*.npy")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -494,9 +625,10 @@ def main():
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
-    parser.add_argument("--phase", type=int, choices=[0, 1, 2, 3], default=0,
+    parser.add_argument("--phase", type=int, choices=[0, 1, 2, 3, 4], default=0,
                         help="Phase to run: 0=all, 1=head-only, 2=both subphases, "
-                             "3=phase2b only (resume from existing phase2a_best.pt)")
+                             "3=phase2b only (resume from existing phase2a_best.pt), "
+                             "4=k-fold cross-validation + ensemble")
     parser.add_argument("--run-name", type=str, default="run",
                         help="Prefix for checkpoint filenames, e.g. 'v1' → v1_phase1_best.pt, v1_ovr_best.pt")
     parser.add_argument("--radimagenet-weights", type=str, default=None,
@@ -533,6 +665,9 @@ def main():
 
     if args.phase == 3:
         train_phase2b_only(config, args.data_dir, args.metadata_dir, device, logger)
+
+    if args.phase == 4:
+        run_kfold(config, args.data_dir, args.metadata_dir, device, logger)
 
 
 if __name__ == "__main__":

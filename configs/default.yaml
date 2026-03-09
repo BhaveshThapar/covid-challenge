@@ -57,6 +57,10 @@ eval:
   threshold_steps: 41          # 0.01 increments over [0.30, 0.70]
   tta_n: 4                     # TTA augmentations at inference (0 = disable)
 
+# K-Fold Cross-Validation
+kfold:
+  n_splits: 3                  # Number of folds (K); total compute = K × (P1 + P2a + P2b)
+
 # Misc
 seed: 42
 checkpoint_dir: "checkpoints"
