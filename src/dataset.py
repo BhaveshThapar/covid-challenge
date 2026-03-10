@@ -288,7 +288,7 @@ class ScanDataset(Dataset):
         images = torch.stack(images)  # (K, 3, H, W)
         label = entry["label"]
         source = entry["source"]
-        return images, label, source
+        return images, label, source, entry["scan_name"]
 
 
 class RawSliceScanDataset(Dataset):
@@ -317,7 +317,7 @@ class RawSliceScanDataset(Dataset):
             selected = all_slices
 
         raw_imgs = [_load_image(p) for p in selected]
-        return raw_imgs, entry["label"], entry["source"]
+        return raw_imgs, entry["label"], entry["source"], entry["scan_name"]
 
 
 def scan_collate_fn(batch):
@@ -325,7 +325,7 @@ def scan_collate_fn(batch):
     Custom collate for ScanDataset since scans can have different numbers of slices.
     Pads to the max number of slices in the batch.
     """
-    images_list, labels, sources = zip(*batch)
+    images_list, labels, sources, scan_names = zip(*batch)
     max_slices = max(img.shape[0] for img in images_list)
 
     padded = []
@@ -345,7 +345,7 @@ def scan_collate_fn(batch):
     masks = torch.stack(masks)     # (B, K)
     labels = torch.tensor(labels, dtype=torch.long)
     sources = torch.tensor(sources, dtype=torch.long)
-    return images, labels, sources, masks
+    return images, labels, sources, masks, list(scan_names)
 
 
 # ---------- Center-Stratified Batch Sampler ---------- #

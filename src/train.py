@@ -97,7 +97,7 @@ def evaluate_scans(
     all_preds, all_labels, all_sources = [], [], []
 
     with torch.no_grad():
-        for images, labels, sources, masks in val_loader:
+        for images, labels, sources, masks, _ in val_loader:
             B, K, C, H, W = images.shape
             x_flat = images.view(B * K, C, H, W).to(device)
 

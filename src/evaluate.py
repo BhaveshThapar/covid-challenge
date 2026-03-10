@@ -66,10 +66,10 @@ def collect_scan_probs(
     )
 
     model.eval()
-    all_probs, all_labels, all_sources = [], [], []
+    all_probs, all_labels, all_sources, all_scan_names = [], [], [], []
 
     with torch.no_grad():
-        for images, labels, sources, masks in tqdm(val_loader, desc="Inference"):
+        for images, labels, sources, masks, scan_names in tqdm(val_loader, desc="Inference"):
             B, K, C, H, W = images.shape
             x_flat = images.view(B * K, C, H, W).to(device)
 
@@ -83,8 +83,9 @@ def collect_scan_probs(
             all_probs.extend(scan_probs.cpu().numpy())
             all_labels.extend(labels.numpy())
             all_sources.extend(sources.numpy())
+            all_scan_names.extend(scan_names)
 
-    return np.array(all_probs), np.array(all_labels), np.array(all_sources)
+    return np.array(all_probs), np.array(all_labels), np.array(all_sources), all_scan_names
 
 
 def collect_scan_probs_tta(
@@ -109,11 +110,10 @@ def collect_scan_probs_tta(
     raw_ds = RawSliceScanDataset(val_entries, slices_per_scan=k)
 
     model.eval()
-    all_probs, all_labels, all_sources = [], [], []
+    all_probs, all_labels, all_sources, all_scan_names = [], [], [], []
 
     for idx in tqdm(range(len(raw_ds)), desc=f"TTA Inference (n={tta_n})"):
-        raw_imgs, label, source = raw_ds[idx]   # list of np.ndarray, int, int
-        n_slices = len(raw_imgs)
+        raw_imgs, label, source, scan_name = raw_ds[idx]   # list of np.ndarray, int, int, str
 
         aug_probs = []  # one entry per TTA augmentation, shape (n_slices,)
         for tfm in tta_tfms:
@@ -131,8 +131,9 @@ def collect_scan_probs_tta(
         all_probs.append(scan_prob)
         all_labels.append(label)
         all_sources.append(source)
+        all_scan_names.append(scan_name)
 
-    return np.array(all_probs), np.array(all_labels), np.array(all_sources)
+    return np.array(all_probs), np.array(all_labels), np.array(all_sources), all_scan_names
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +192,84 @@ def print_results(
 
 
 # ---------------------------------------------------------------------------
+# Per-scan COVID breakdown
+# ---------------------------------------------------------------------------
+
+def print_covid_breakdown(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    sources: np.ndarray,
+    scan_names: list,
+    threshold: float,
+    label: str = "",
+    save_csv: str = None,
+):
+    """
+    For each medical center, print which COVID scans (label=0) were correctly
+    detected (TP: prob < threshold) vs. missed (FN: prob >= threshold).
+
+    Optionally saves a full per-scan CSV with columns:
+        scan_name, center, label, prob, pred, correct
+    """
+    tag = f" [{label}]" if label else ""
+    print(f"\n{'='*55}")
+    print(f"COVID SCAN BREAKDOWN BY CENTER{tag}  (threshold={threshold:.2f})")
+    print(f"{'='*55}")
+
+    probs = np.array(probs)
+    labels = np.array(labels)
+    sources = np.array(sources)
+
+    covid_mask = labels == 0
+    covid_idx = np.where(covid_mask)[0]
+
+    rows = []  # for CSV
+
+    for center in sorted(set(sources)):
+        center_covid = [i for i in covid_idx if sources[i] == center]
+        if not center_covid:
+            print(f"\n  Center {center}: no COVID scans found")
+            continue
+
+        tp = [(i, probs[i]) for i in center_covid if probs[i] < threshold]
+        fn = [(i, probs[i]) for i in center_covid if probs[i] >= threshold]
+
+        # Sort: TPs by confidence descending (most confident first), FNs ascending (hardest first)
+        tp.sort(key=lambda x: -x[1])
+        fn.sort(key=lambda x: x[1])
+
+        print(f"\n  Center {center} — {len(center_covid)} COVID scans  |  TP={len(tp)}  FN={len(fn)}")
+        if tp:
+            print(f"    CORRECT (TP={len(tp)}):")
+            for i, p in tp:
+                print(f"      {scan_names[i]:<40}  prob={p:.3f}")
+        if fn:
+            print(f"    MISSED  (FN={len(fn)}):")
+            for i, p in fn:
+                print(f"      {scan_names[i]:<40}  prob={p:.3f}  ← missed")
+
+        for i, p in (tp + fn):
+            pred = int(p >= threshold)
+            rows.append({
+                "scan_name": scan_names[i],
+                "center": int(center),
+                "label": int(labels[i]),
+                "prob": round(float(p), 4),
+                "pred": pred,
+                "correct": int(pred == labels[i]),
+            })
+
+    if save_csv:
+        import csv, os
+        os.makedirs(os.path.dirname(save_csv) or ".", exist_ok=True)
+        with open(save_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["scan_name", "center", "label", "prob", "pred", "correct"])
+            writer.writeheader()
+            writer.writerows(sorted(rows, key=lambda r: (r["center"], r["scan_name"])))
+        print(f"\n  Saved per-scan CSV → {save_csv}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -205,6 +284,8 @@ def main():
                         help="Disable TTA (uses config eval.tta_n when not set)")
     parser.add_argument("--no-tune-threshold", action="store_true",
                         help="Use config threshold (default 0.5) instead of sweeping")
+    parser.add_argument("--output-csv", type=str, default=None,
+                        help="If set, save per-scan COVID breakdown to this CSV path")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -229,7 +310,7 @@ def main():
 
     # ---- Step 1: Inference without TTA ----
     print("\n--- Running inference (no TTA)...")
-    probs, labels, sources = collect_scan_probs(model, val_entries, config, device, use_amp)
+    probs, labels, sources, scan_names = collect_scan_probs(model, val_entries, config, device, use_amp)
 
     if args.no_tune_threshold:
         thresh_base = eval_cfg.get("threshold", 0.5)
@@ -239,11 +320,15 @@ def main():
         print(f"Tuned threshold (no TTA): {thresh_base:.2f}  →  avg F1: {f1_tuned:.4f}")
 
     print_results(probs, labels, sources, thresh_base, label="No TTA")
+    print_covid_breakdown(probs, labels, sources, scan_names, thresh_base, label="No TTA",
+                          save_csv=args.output_csv)
 
     # ---- Step 2: TTA inference (if enabled) ----
     if tta_n > 0:
         print(f"\n--- Running TTA inference (n={tta_n})...")
-        tta_probs, _, _ = collect_scan_probs_tta(model, val_entries, config, device, tta_n, use_amp)
+        tta_probs, _, _, tta_scan_names = collect_scan_probs_tta(
+            model, val_entries, config, device, tta_n, use_amp
+        )
 
         # Independently tune threshold on TTA probabilities (distribution differs from no-TTA)
         if args.no_tune_threshold:
@@ -253,6 +338,9 @@ def main():
             print(f"Tuned threshold (TTA):    {thresh_tta:.2f}  →  avg F1: {f1_tta_tuned:.4f}")
 
         print_results(tta_probs, labels, sources, thresh_tta, label=f"TTA n={tta_n}")
+        tta_csv = args.output_csv.replace(".csv", "_tta.csv") if args.output_csv else None
+        print_covid_breakdown(tta_probs, labels, sources, tta_scan_names, thresh_tta,
+                              label=f"TTA n={tta_n}", save_csv=tta_csv)
 
 
 if __name__ == "__main__":
