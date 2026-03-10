@@ -48,6 +48,8 @@ GOOGLE_DRIVE_IDS = {
     "train_non_covid.csv":  "1nrjof8Qu55WEazgGtx2oSM_cCYO1J-Tx",
     "validation_covid.csv": "155W8e4h0t1odKspjxCiK6Cl4-81PK2zH",
     "validation_non_covid.csv": "1dhVi_0Sldyj4hrBpfRGkLV4PObyzDsj5",
+    # Test set (1st challenge, unlabeled)
+    "1st_challenge_test_set.zip": "1mcHL63ILDYh7IQFnMtW_0p0grmb5vhc6",
 }
 # ---------------------------------------------------------------------------
 
@@ -68,7 +70,8 @@ def download_all(datasets_dir: str, metadata_dir: str):
     os.makedirs(metadata_dir, exist_ok=True)
 
     archives = ["covid1.rar", "covid2.rar", "non-covid1.rar",
-                "non-covid2.rar", "non-covid3.rar", "Validation.zip"]
+                "non-covid2.rar", "non-covid3.rar", "Validation.zip",
+                "1st_challenge_test_set.zip"]
     csvs = ["train_covid.csv", "train_non_covid.csv",
             "validation_covid.csv", "validation_non_covid.csv"]
 
@@ -189,6 +192,24 @@ def organize_validation(extract_dir: str, data_dir: str):
             if os.path.isdir(src) and not os.path.exists(dst):
                 shutil.move(src, dst)
         print(f"  Moved non-covid val scans to {val_noncovid_dst}")
+
+
+def organize_test(extract_dir: str, data_dir: str):
+    """Move test scan folders (ct_scan_*) into data/test/."""
+    test_dst = os.path.join(data_dir, "test")
+    os.makedirs(test_dst, exist_ok=True)
+
+    # Search for ct_scan_* dirs (flat or nested)
+    for root, dirs, _ in os.walk(extract_dir):
+        for d in dirs:
+            if d.startswith("ct_scan_"):
+                src = os.path.join(root, d)
+                dst = os.path.join(test_dst, d)
+                if os.path.isdir(src) and not os.path.exists(dst):
+                    shutil.move(src, dst)
+
+    count = len([x for x in os.listdir(test_dst) if os.path.isdir(os.path.join(test_dst, x))])
+    print(f"  Test scans: {count}")
 
 
 def copy_csvs(datasets_dir: str, metadata_dir: str):
@@ -363,6 +384,15 @@ def main():
             shutil.rmtree(args.temp_dir, ignore_errors=True)
             os.makedirs(args.temp_dir, exist_ok=True)
 
+    # 6. Extract test set
+    test_zip = os.path.join(args.datasets_dir, "1st_challenge_test_set.zip")
+    if os.path.exists(test_zip):
+        print("\n=== Extracting Test Set ===")
+        extract_zip(test_zip, args.temp_dir)
+        organize_test(args.temp_dir, args.data_dir)
+        shutil.rmtree(args.temp_dir, ignore_errors=True)
+        os.makedirs(args.temp_dir, exist_ok=True)
+
     # Cleanup
     shutil.rmtree(args.temp_dir, ignore_errors=True)
 
@@ -374,6 +404,10 @@ def main():
             if os.path.exists(d):
                 n = len([x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x))])
                 print(f"  {split}/{label}: {n} scans")
+    test_d = os.path.join(args.data_dir, "test")
+    if os.path.exists(test_d):
+        n = len([x for x in os.listdir(test_d) if os.path.isdir(os.path.join(test_d, x))])
+        print(f"  test: {n} scans")
     print(f"\nMetadata files in {metadata_dir}:")
     if os.path.exists(metadata_dir):
         for f in sorted(os.listdir(metadata_dir)):

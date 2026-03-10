@@ -176,6 +176,26 @@ Flags:
 | OOM on full-slice validation (V100, 16 GB) | `full_val_every_n_epochs: 999`; `eval.batch_size: 1` |
 | 1-2 missing scan directories | Logged at startup, training continues without them |
 
+## Test Set Inference
+
+The 1st challenge test set is included in the download script. After extraction, `data/test/` contains unlabeled scans.
+
+```bash
+# 1. Extract data (includes test) if not done:
+sbatch slurm/extract.sbatch
+
+# 2. Run test predictions (downloads test if missing, then predicts):
+sbatch slurm/test.sbatch
+```
+
+Output: `predictions_test.csv` with columns `scan_name`, `prediction` (0=non_covid, 1=covid), `prob_covid`.
+
+To use TTA or a custom threshold:
+```bash
+python src/predict_test.py --checkpoint checkpoints/v1_ovr_best.pt \
+    --output predictions_test.csv --threshold 0.5 --tta
+```
+
 ## Updating from Laptop → Nexus
 
 ```bash

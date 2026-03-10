@@ -200,6 +200,54 @@ def build_scan_manifest(data_dir: str, split: str, metadata_dir: str = None):
     return entries
 
 
+def build_test_manifest(data_dir: str, metadata_dir: str = None):
+    """
+    Build a list of scan entries for the test set (unlabeled).
+    Expects data/test/ with ct_scan_* subdirectories.
+    Returns entries with label=0 (dummy) and source=-1 (or from CSV if provided).
+    """
+    test_dir = os.path.join(data_dir, "test")
+    if not os.path.isdir(test_dir):
+        return []
+
+    source_map = {}
+    if metadata_dir:
+        for csv_name in ["test.csv", "test_covid.csv", "test_non_covid.csv"]:
+            csv_path = os.path.join(metadata_dir, csv_name)
+            if os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path)
+                    name_col = next((c for c in df.columns if "scan" in c.lower()), None)
+                    ctr_col = next((c for c in df.columns if any(
+                        k in c.lower() for k in ("centre", "center", "source")
+                    )), None)
+                    if name_col and ctr_col:
+                        for _, row in df.iterrows():
+                            source_map[str(row[name_col])] = int(row[ctr_col])
+                except Exception:
+                    pass
+                break
+
+    entries = []
+    for scan_name in sorted(os.listdir(test_dir)):
+        scan_dir = os.path.join(test_dir, scan_name)
+        if not os.path.isdir(scan_dir):
+            continue
+        if not scan_name.startswith("ct_scan_"):
+            continue
+        slices = _get_sorted_slices(scan_dir)
+        if not slices:
+            continue
+        source = source_map.get(scan_name, -1)
+        entries.append({
+            "scan_dir": scan_dir,
+            "label": 0,  # Dummy for inference; not used
+            "source": source,
+            "scan_name": scan_name,
+        })
+    return entries
+
+
 # ---------- Slice-Level Dataset ---------- #
 
 class SliceDataset(Dataset):
