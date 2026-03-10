@@ -39,3 +39,6 @@ Thumbs.db
 
 # Misc
 SUMMARY.md
+.claude/
+paper/
+assets/
