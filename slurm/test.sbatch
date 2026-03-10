@@ -41,6 +41,7 @@ python src/predict_test.py \
     --data-dir data \
     --metadata-dir datasets \
     --output predictions_test.csv \
-    --threshold 0.5
+    --threshold 0.5 \
+    --tta
 
 echo "Done at $(date)"
