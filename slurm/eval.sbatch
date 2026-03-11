@@ -32,6 +32,7 @@ python src/evaluate.py \
     --checkpoint checkpoints/v1_ovr_best.pt \
     --data-dir data \
     --metadata-dir datasets \
-    --split val
+    --split val \
+    --output-csv validation_results.csv
 
 echo "Done at $(date)"

@@ -9,6 +9,7 @@ Usage:
 import os
 import sys
 import argparse
+import csv
 
 import numpy as np
 import torch
@@ -150,6 +151,8 @@ def main():
     parser.add_argument("--split", type=str, default="val")
     parser.add_argument("--no-tta", action="store_true", help="Disable TTA")
     parser.add_argument("--no-tune-threshold", action="store_true")
+    parser.add_argument("--output-csv", type=str, default="",
+                        help="Save per-scan CSV: scan_name, label, prediction, prob_covid, correct")
     args = parser.parse_args()
 
     config_path = args.config or MODEL_CONFIGS[args.model]
@@ -215,6 +218,7 @@ def main():
         print(f"Tuned threshold: {thresh:.2f}  →  avg F1: {f1:.4f}")
 
     print_results(probs, labels, sources, thresh, label="No TTA")
+    final_probs, final_thresh = probs, thresh
 
     if tta_n > 0 and args.model != "efficientnet":
         print(f"\n--- TTA inference (n={tta_n})...")
@@ -227,6 +231,24 @@ def main():
             thresh_tta, f1_tta = tune_threshold(tta_probs, labels, sources, lo, hi, steps)
             print(f"TTA tuned threshold: {thresh_tta:.2f}  →  avg F1: {f1_tta:.4f}")
         print_results(tta_probs, labels, sources, thresh_tta, label=f"TTA n={tta_n}")
+        final_probs, final_thresh = tta_probs, thresh_tta
+
+    if args.output_csv:
+        scan_names = [e["scan_name"] for e in val_entries]
+        preds = (final_probs >= final_thresh).astype(int)
+        correct = (preds == labels)
+        label_names = {0: "covid", 1: "non_covid"}
+        os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
+        with open(args.output_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["scan_name", "label", "label_name", "prediction", "pred_name", "prob_covid", "correct", "source"])
+            for name, lab, pred, prob, ok, src in zip(scan_names, labels, preds, final_probs, correct, sources):
+                w.writerow([
+                    name, int(lab), label_names.get(lab, str(lab)),
+                    int(pred), label_names.get(pred, str(pred)),
+                    f"{prob:.6f}", "yes" if ok else "no", int(src)
+                ])
+        print(f"\nSaved per-scan results to {args.output_csv}")
 
 
 if __name__ == "__main__":
