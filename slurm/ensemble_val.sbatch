@@ -19,7 +19,7 @@ mkdir -p "$TORCH_HOME" logs
 module load Python3/3.10.14
 source venv/bin/activate
 
-echo "=== Ensemble Validation + Weight Tuning ==="
+echo "=== Ensemble Validation (Majority Vote) ==="
 echo "Node: $(hostname)"
 echo "Start: $(date)"
 
@@ -27,10 +27,9 @@ python src/ensemble.py \
     --config configs/ensemble.yaml \
     --data-dir data \
     --metadata-dir datasets \
-    --output predictions_ensemble_val.csv \
+    --output results/predictions_ensemble_majority_val.csv \
     --split val \
-    --tune-weights \
-    --per-source-threshold \
+    --tune-threshold \
     --gpus 0 1 2
 
 echo "Done at $(date)"

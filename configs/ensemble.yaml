@@ -1,9 +1,8 @@
-# Ensemble configuration — Multi-Source COVID-19 Detection
-# Weighted average of DINOv2, DenseNet, EfficientNet
+# Ensemble configuration — Majority vote (DINOv2, DenseNet, EfficientNet)
+# Each model predicts 0/1; final prediction = majority per scan
 
 ensemble:
-  weights: [0.33, 0.33, 0.34]   # [dinov2, densenet, efficientnet] — tune on val
-  threshold: 0.5
+  threshold: 0.5  # threshold for binarizing each model's P(covid) before voting
 
 models:
   dinov2:

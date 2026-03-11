@@ -1,10 +1,10 @@
 """
 Ensemble inference: run DINOv2, DenseNet, and EfficientNet in parallel on separate GPUs,
-merge predictions via weighted average of P(covid), output final CSV.
+merge predictions via majority vote per scan, output final CSV.
 
 Usage:
   python src/ensemble.py --config configs/ensemble.yaml --output predictions_ensemble.csv
-  python src/ensemble.py --weights 0.4 0.3 0.3  # override weights
+  python src/ensemble.py --tune-threshold  # sweep threshold on val for best F1
 """
 import os
 import sys
@@ -218,88 +218,47 @@ def _run_efficientnet(gpu_id: int, config_path: str, checkpoint: str, data_dir: 
     out_queue.put(("efficientnet", scan_names, np.array(all_probs)))
 
 
-def _tune_weights_threshold(prob_dino, prob_dense, prob_eff, labels, sources,
-                            w_steps=11, t_steps=21):
-    """Grid search over weights and threshold. Returns (best_weights, best_thresh, best_f1)."""
+def _tune_majority_threshold(prob_dino, prob_dense, prob_eff, labels, sources, t_steps=21):
+    """Sweep threshold for binarizing each model's output in majority vote. Returns (best_thresh, best_f1)."""
     from src.utils import compute_per_source_f1
-    best_f1, best_w, best_t = 0.0, None, 0.5
-    for w1 in np.linspace(0, 1, w_steps):
-        for w2 in np.linspace(0, 1 - w1, w_steps):
-            w3 = 1 - w1 - w2
-            if w3 < 0:
-                continue
-            weights = np.array([w1, w2, w3])
-            prob_ens = weights[0] * prob_dino + weights[1] * prob_dense + weights[2] * prob_eff
-            for t in np.linspace(0.3, 0.7, t_steps):
-                preds = (prob_ens >= t).astype(int)
-                f1 = compute_per_source_f1(labels, preds, sources)["average"]
-                if f1 > best_f1:
-                    best_f1, best_w, best_t = f1, weights.copy(), t
-    return best_w, best_t, best_f1
-
-
-def _tune_per_source_threshold(prob_ensemble, labels, sources):
-    """Sweep a separate threshold per source. Returns (best_preds, per_source_thresh, best_f1)."""
-    from src.utils import compute_per_source_f1
-    from sklearn.metrics import f1_score
-    p = np.array(prob_ensemble)
-    labels_arr = np.array(labels)
-    sources_arr = np.array(sources)
-    unique_sources = sorted(np.unique(sources_arr))
-    per_source_thresh = {}
-    preds = np.zeros(len(p), dtype=int)
-    for src in unique_sources:
-        mask = sources_arr == src
-        if mask.sum() == 0:
-            continue
-        p_src = p[mask]
-        l_src = labels_arr[mask]
-        best_t, best_f1 = 0.5, 0.0
-        for t in np.arange(0.20, 0.80, 0.01):
-            pred_src = (p_src >= t).astype(int)
-            present = np.unique(l_src)
-            f1 = f1_score(l_src, pred_src, average="macro", labels=present, zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        per_source_thresh[f"source_{src}"] = best_t
-        preds[mask] = (p_src >= best_t).astype(int)
-    f1_dict = compute_per_source_f1(labels_arr, preds, sources_arr)
-    return preds, per_source_thresh, f1_dict["average"]
+    best_f1, best_t = 0.0, 0.5
+    for t in np.linspace(0.3, 0.7, t_steps):
+        pred_dino = (prob_dino >= t).astype(int)
+        pred_dense = (prob_dense >= t).astype(int)
+        pred_eff = (prob_eff >= t).astype(int)
+        vote_sum = pred_dino + pred_dense + pred_eff
+        preds = (vote_sum >= 2).astype(int)
+        f1 = compute_per_source_f1(labels, preds, sources)["average"]
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return best_t, best_f1
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ensemble prediction (3 models, multi-GPU)")
+    parser = argparse.ArgumentParser(description="Ensemble prediction via majority vote (3 models, multi-GPU)")
     parser.add_argument("--config", type=str, default="configs/ensemble.yaml")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="datasets")
     parser.add_argument("--output", type=str, default="predictions_ensemble.csv")
     parser.add_argument("--split", type=str, default="test", choices=["test", "val"],
                         help="test=unlabeled, val=validation with labels")
-    parser.add_argument("--tune-weights", action="store_true",
-                        help="Grid search weights+threshold on val (requires --split val)")
-    parser.add_argument("--per-source-threshold", action="store_true",
-                        help="Use per-source thresholds (requires --split val)")
-    parser.add_argument("--threshold", type=float, default=None, help="Override config threshold")
-    parser.add_argument("--weights", type=float, nargs=3, default=None,
-                        help="Override weights: w_dino w_dense w_eff")
+    parser.add_argument("--tune-threshold", action="store_true",
+                        help="Sweep threshold for binarization on val (requires --split val)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Override config threshold for binarizing each model's output")
     parser.add_argument("--gpus", type=int, nargs=3, default=[0, 1, 2],
                         help="GPU IDs for dinov2, densenet, efficientnet")
     args = parser.parse_args()
-    if (args.tune_weights or args.per_source_threshold) and args.split != "val":
-        print("ERROR: --tune-weights and --per-source-threshold require --split val")
+    if args.tune_threshold and args.split != "val":
+        print("ERROR: --tune-threshold requires --split val")
         sys.exit(1)
 
     from src.utils import load_config, compute_per_source_f1, print_confusion_matrices
     from src.dataset import build_test_manifest, build_scan_manifest
 
     config = load_config(args.config)
-    ens = config["ensemble"]
     models_cfg = config["models"]
-
-    weights = args.weights if args.weights else ens["weights"]
-    weights = np.array(weights, dtype=float)
-    weights = weights / weights.sum()
-    threshold = args.threshold if args.threshold is not None else ens["threshold"]
+    threshold = args.threshold if args.threshold is not None else config.get("ensemble", {}).get("threshold", 0.5)
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(base_dir, args.data_dir) if not os.path.isabs(args.data_dir) else args.data_dir
@@ -363,27 +322,19 @@ def main():
     prob_dense = results["densenet"][1]
     prob_eff = results["efficientnet"][1]
 
-    prob_ensemble = weights[0] * prob_dino + weights[1] * prob_dense + weights[2] * prob_eff
-
-    # Tune weights + threshold on val (if requested)
-    if split == "val" and args.tune_weights:
-        print("Tuning weights and threshold...")
-        weights, threshold, best_f1 = _tune_weights_threshold(
+    # Binarize each model's predictions, then take majority per scan
+    if split == "val" and args.tune_threshold:
+        threshold, best_f1 = _tune_majority_threshold(
             prob_dino, prob_dense, prob_eff, labels, sources
         )
-        print(f"Best weights: DINOv2={weights[0]:.2f}, DenseNet={weights[1]:.2f}, EfficientNet={weights[2]:.2f}")
-        print(f"Best threshold: {threshold:.2f}  →  Val F1: {best_f1:.4f}")
-        prob_ensemble = weights[0] * prob_dino + weights[1] * prob_dense + weights[2] * prob_eff
-
-    preds = (prob_ensemble >= threshold).astype(int)
-
-    # Per-source threshold (val only)
-    if split == "val" and args.per_source_threshold:
-        preds, ps_thresh, ps_f1 = _tune_per_source_threshold(prob_ensemble, labels, sources)
-        print("\nPer-source thresholds:")
-        for k, t in sorted(ps_thresh.items()):
-            print(f"  {k}: {t:.2f}")
-        print(f"Per-source threshold F1: {ps_f1:.4f}")
+        print(f"Tuned threshold: {threshold:.2f}  →  Val F1: {best_f1:.4f}")
+    pred_dino = (prob_dino >= threshold).astype(int)
+    pred_dense = (prob_dense >= threshold).astype(int)
+    pred_eff = (prob_eff >= threshold).astype(int)
+    vote_sum = pred_dino + pred_dense + pred_eff
+    preds = (vote_sum >= 2).astype(int)  # 2 or 3 models vote Covid → Covid
+    prob_ensemble = vote_sum / 3.0  # fraction of models voting Covid (0, 1/3, 2/3, 1)
+    print(f"Majority vote (threshold={threshold:.2f}): {np.sum(preds)} Covid, {len(preds) - np.sum(preds)} Non-Covid")
 
     if split == "val":
         f1_dict = compute_per_source_f1(labels, preds, sources)
@@ -408,7 +359,7 @@ def main():
             for name, p, prob in zip(scan_names, preds, prob_ensemble):
                 w.writerow([name, int(p), f"{prob:.6f}"])
 
-    print(f"Ensemble weights: DINOv2={weights[0]:.2f}, DenseNet={weights[1]:.2f}, EfficientNet={weights[2]:.2f}")
+    print(f"Majority vote | threshold={threshold:.2f}")
     print(f"Saved {len(scan_names)} predictions to {args.output}")
     print(f"  Covid (1): {(preds == 1).sum()}, Non-Covid (0): {(preds == 0).sum()}")
 
