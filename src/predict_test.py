@@ -28,54 +28,56 @@ from torch.utils.data import DataLoader
 
 
 def collect_test_probs(model, entries, config, device, use_amp=True):
-    """Run inference on test scans, return (probs, scan_names)."""
+    """Run inference on test scans. Returns (probs, scan_names, skipped)."""
     img_size = config["data"]["image_size"]
-    ds = ScanDataset(
-        entries,
-        get_val_transforms(img_size),
-        slices_per_scan=config["eval"]["slices_per_scan"],
-    )
+    k = config["eval"]["slices_per_scan"]
+    ds = ScanDataset(entries, get_val_transforms(img_size), slices_per_scan=k)
     loader = DataLoader(
-        ds,
-        batch_size=config["eval"]["batch_size"],
-        shuffle=False,
-        num_workers=config["data"]["num_workers"],
-        pin_memory=config["data"]["pin_memory"],
-        collate_fn=scan_collate_fn,
+        ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=scan_collate_fn,
     )
-
     model.eval()
-    all_probs = []
-    scan_names = [e["scan_name"] for e in entries]
-
-    with torch.no_grad():
-        for i, (images, _, _, masks) in enumerate(tqdm(loader, desc="Inference")):
+    all_probs, all_names, skipped = [], [], []
+    loader_iter = iter(loader)
+    for idx in tqdm(range(len(entries)), desc="Inference"):
+        try:
+            images, _, _, masks = next(loader_iter)
+        except StopIteration:
+            break
+        except Exception as e:
+            skipped.append((entries[idx]["scan_name"], str(e)[:100]))
+            continue
+        with torch.no_grad():
             B, K, C, H, W = images.shape
             x_flat = images.view(B * K, C, H, W).to(device)
-
             with autocast(enabled=use_amp):
                 logits = model(x_flat).squeeze(-1)
-
             probs = torch.sigmoid(logits).view(B, K)
             valid = masks.float().to(device)
             scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)
-            all_probs.extend(scan_probs.cpu().numpy())
+            all_probs.append(scan_probs.cpu().item())
+            all_names.append(entries[idx]["scan_name"])
+    return np.array(all_probs) if all_probs else np.array([]), all_names, skipped
 
-    return np.array(all_probs), scan_names
+
+def _sources_for_names(entries, names):
+    name_to_src = {e["scan_name"]: e["source"] for e in entries}
+    return [name_to_src.get(n, -1) for n in names]
 
 
 def collect_test_probs_tta(model, entries, config, device, tta_n=4, use_amp=True):
-    """Run TTA inference on test scans."""
+    """Run TTA inference on test scans. Returns (probs, scan_names, skipped)."""
     img_size = config["data"]["image_size"]
     tta_tfms = get_tta_transforms(img_size)[:tta_n]
     k = config["eval"]["slices_per_scan"]
     raw_ds = RawSliceScanDataset(entries, slices_per_scan=k)
-
     model.eval()
-    all_probs = []
-
+    all_probs, all_names, skipped = [], [], []
     for idx in tqdm(range(len(raw_ds)), desc=f"TTA Inference (n={tta_n})"):
-        raw_imgs, _, _ = raw_ds[idx]
+        try:
+            raw_imgs, _, _ = raw_ds[idx]
+        except Exception as e:
+            skipped.append((entries[idx]["scan_name"], str(e)[:100]))
+            continue
         aug_probs = []
         for tfm in tta_tfms:
             tensors = torch.stack([tfm(image=img)["image"] for img in raw_imgs]).to(device)
@@ -85,8 +87,8 @@ def collect_test_probs_tta(model, entries, config, device, tta_n=4, use_amp=True
             aug_probs.append(torch.sigmoid(logits).cpu().numpy())
         slice_probs = np.mean(aug_probs, axis=0)
         all_probs.append(slice_probs.mean())
-
-    return np.array(all_probs), [e["scan_name"] for e in entries]
+        all_names.append(entries[idx]["scan_name"])
+    return np.array(all_probs) if all_probs else np.array([]), all_names, skipped
 
 
 def main():
@@ -118,26 +120,33 @@ def main():
 
     tta_n = config["eval"].get("tta_n", 4) if args.tta else 0
     if tta_n > 0:
-        probs, scan_names = collect_test_probs_tta(
+        probs, scan_names, skipped = collect_test_probs_tta(
             model, entries, config, device, tta_n, use_amp
         )
     else:
-        probs, scan_names = collect_test_probs(model, entries, config, device, use_amp)
+        probs, scan_names, skipped = collect_test_probs(model, entries, config, device, use_amp)
 
-    preds = (probs >= args.threshold).astype(int)
-    sources = [e["source"] for e in entries]
+    preds = (probs >= args.threshold).astype(int) if len(probs) > 0 else np.array([])
+    sources = _sources_for_names(entries, scan_names)
+    pred_names = {0: "non_covid", 1: "covid"}
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    pred_names = {0: "non_covid", 1: "covid"}
     with open(args.output, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["scan_name", "prediction", "pred_name", "prob_covid", "source"])
+        w.writerow(["scan_name", "prediction", "pred_name", "prob_covid", "source", "status"])
         for name, p, prob, src in zip(scan_names, preds, probs, sources):
-            w.writerow([name, int(p), pred_names.get(p, str(p)), f"{prob:.6f}", int(src)])
+            w.writerow([name, int(p), pred_names.get(p, str(p)), f"{prob:.6f}", int(src), "predicted"])
+        for name, reason in skipped:
+            w.writerow([name, "", "", "", -1, f"skipped ({reason})"])
 
-    print(f"Saved {len(scan_names)} predictions to {args.output}")
-    print(f"  Covid (1): {(preds == 1).sum()}")
-    print(f"  Non-Covid (0): {(preds == 0).sum()}")
+    print(f"Saved to {args.output}")
+    print(f"  Predicted: {len(scan_names)} (Covid: {(preds == 1).sum()}, Non-Covid: {(preds == 0).sum()})")
+    if skipped:
+        print(f"  Skipped:   {len(skipped)}")
+        for name, r in skipped[:5]:
+            print(f"    - {name}: {r[:60]}{'...' if len(r) > 60 else ''}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped) - 5} more")
     print(f"  Threshold: {args.threshold}")
 
 

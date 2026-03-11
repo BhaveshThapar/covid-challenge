@@ -87,6 +87,15 @@ def _load_image(path: str) -> np.ndarray:
     return np.array(img)
 
 
+def _load_image_safe(path: str):
+    """Load image; return None if corrupt/unreadable (skips bad files instead of crashing)."""
+    try:
+        img = Image.open(path).convert("RGB")
+        return np.array(img)
+    except Exception:
+        return None
+
+
 def _get_sorted_slices(scan_dir: str) -> list:
     """Get sorted list of JPEG slice paths in a scan directory."""
     exts = {".jpg", ".jpeg", ".png"}
@@ -364,7 +373,13 @@ class RawSliceScanDataset(Dataset):
         else:
             selected = all_slices
 
-        raw_imgs = [_load_image(p) for p in selected]
+        raw_imgs = []
+        for p in selected:
+            arr = _load_image_safe(p)
+            if arr is not None:
+                raw_imgs.append(arr)
+        if not raw_imgs:
+            raise ValueError(f"No valid slices in {entry['scan_name']}")
         return raw_imgs, entry["label"], entry["source"]
 
 
