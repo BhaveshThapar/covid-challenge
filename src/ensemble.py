@@ -399,9 +399,14 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["scan_name", "prediction", "prob_covid"])
-        for name, p, prob in zip(scan_names, preds, prob_ensemble):
-            w.writerow([name, int(p), f"{prob:.6f}"])
+        if split == "val" and sources is not None:
+            w.writerow(["scan_name", "source", "prediction", "prob_covid"])
+            for name, src, p, prob in zip(scan_names, sources, preds, prob_ensemble):
+                w.writerow([name, int(src), int(p), f"{prob:.6f}"])
+        else:
+            w.writerow(["scan_name", "prediction", "prob_covid"])
+            for name, p, prob in zip(scan_names, preds, prob_ensemble):
+                w.writerow([name, int(p), f"{prob:.6f}"])
 
     print(f"Ensemble weights: DINOv2={weights[0]:.2f}, DenseNet={weights[1]:.2f}, EfficientNet={weights[2]:.2f}")
     print(f"Saved {len(scan_names)} predictions to {args.output}")

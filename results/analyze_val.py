@@ -26,12 +26,17 @@ def load_predictions():
     rows = []
     with open(path) as f:
         r = csv.DictReader(f)
+        fieldnames = list(r.fieldnames) if r.fieldnames else []
+        has_source = "source" in fieldnames
         for row in r:
-            rows.append({
+            rw = {
                 "scan_name": row["scan_name"],
                 "prediction": int(row["prediction"]),
                 "prob_covid": float(row["prob_covid"]),
-            })
+            }
+            if has_source and "source" in row:
+                rw["source"] = int(row["source"])
+            rows.append(rw)
     return rows
 
 
@@ -79,13 +84,35 @@ def main():
             from src.utils import compute_per_source_f1, print_confusion_matrices
 
             entries = build_scan_manifest(data_dir, "val", meta_dir)
+            labels = [e["label"] for e in entries]
+            sources = [e["source"] for e in entries]
+
+            # Align predictions with manifest (CSV row order may differ from manifest)
+            has_source_col = "source" in (preds[0] if preds else {})
+            if has_source_col and len(entries) == len(preds):
+                # Robust alignment by (scan_name, source)
+                pred_lut = {(p["scan_name"], p["source"]): (p["prediction"], p["prob_covid"]) for p in preds}
+                pred_arr = []
+                prob_arr = []
+                for e in entries:
+                    key = (e["scan_name"], e["source"])
+                    if key in pred_lut:
+                        pp, pr = pred_lut[key]
+                        pred_arr.append(pp)
+                        prob_arr.append(pr)
+                    else:
+                        pred_arr.append(-1)
+                        prob_arr.append(0.0)
+                if len(pred_arr) != len(entries):
+                    pred_arr = [p["prediction"] for p in preds]
+                    prob_arr = probs
+            else:
+                pred_arr = [p["prediction"] for p in preds]
+                prob_arr = probs
+
             if len(entries) != len(preds):
                 print(f"\nWARNING: manifest has {len(entries)} entries, predictions have {len(preds)}")
             else:
-                labels = [e["label"] for e in entries]
-                sources = [e["source"] for e in entries]
-                pred_arr = [p["prediction"] for p in preds]
-
                 f1_dict = compute_per_source_f1(labels, pred_arr, sources)
                 print("\n--- Per-Source F1 ---")
                 for k in sorted(f1_dict.keys()):
@@ -97,15 +124,13 @@ def main():
                 print_confusion_matrices(labels, pred_arr, sources)
 
                 # FP/FN with prob_covid (label 0=covid, 1=non-covid; pred 0=non-covid, 1=covid)
-                labels_arr = labels
-                fp_probs, fn_probs = [], []
-                for i in range(len(labels_arr)):
-                    if labels_arr[i] == 0 and pred_arr[i] == 0:  # true covid, pred non-covid = FN
-                        fn_probs.append(probs[i])
-                    elif labels_arr[i] == 1 and pred_arr[i] == 1:  # true non-covid, pred covid = FP
-                        fp_probs.append(probs[i])
+                fn_probs = [prob_arr[i] for i in range(len(labels)) if labels[i] == 0 and pred_arr[i] == 0]
+                fp_probs = [prob_arr[i] for i in range(len(labels)) if labels[i] == 1 and pred_arr[i] == 1]
 
-                if fn_probs or fp_probs:
+                if not has_source_col and (len(fn_probs) > 50 or len(fp_probs) > 50):
+                    print("\n--- FP/FN Confidence ---")
+                    print("  (Skipped: row-order mismatch likely. Re-run 'ensemble --split val' to get CSV with 'source' column for correct alignment.)")
+                elif fn_probs or fp_probs:
                     print("\n--- FP/FN Confidence ---")
                     if fn_probs:
                         m = sum(fn_probs) / len(fn_probs)
@@ -114,6 +139,8 @@ def main():
                         m = sum(fp_probs) / len(fp_probs)
                         print(f"  False Positives (true Non, pred Covid): n={len(fp_probs)}, mean prob_covid={m:.4f}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"\nCould not load manifest: {e}")
     else:
         print("\n(Data/metadata dirs not found — skipping manifest-based FP/FN analysis)")
