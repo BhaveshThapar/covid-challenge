@@ -33,6 +33,6 @@ python src/evaluate.py \
     --data-dir data \
     --metadata-dir datasets \
     --split val \
-    --output-csv validation_results.csv
+    --print-results
 
 echo "Done at $(date)"

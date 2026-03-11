@@ -40,7 +40,7 @@ python src/predict_test.py \
     --checkpoint checkpoints/v1_ovr_best.pt \
     --data-dir data \
     --metadata-dir datasets \
-    --output predictions_test.csv \
+    --print-results \
     --threshold 0.5 \
     --tta
 

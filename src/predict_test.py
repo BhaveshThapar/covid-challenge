@@ -97,7 +97,9 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
-    parser.add_argument("--output", type=str, default="predictions_test.csv")
+    parser.add_argument("--output", type=str, default="", help="Write CSV file (optional)")
+    parser.add_argument("--print-results", action="store_true",
+                        help="Print per-scan results to log (for copy-paste)")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--tta", action="store_true", help="Use TTA (4 augmentations)")
     args = parser.parse_args()
@@ -130,16 +132,26 @@ def main():
     sources = _sources_for_names(entries, scan_names)
     pred_names = {0: "non_covid", 1: "covid"}
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["scan_name", "prediction", "pred_name", "prob_covid", "source", "status"])
+    if args.print_results:
+        print("\n" + "=" * 60)
+        print("PER-SCAN TEST RESULTS (copy below into notes/Excel)")
+        print("=" * 60)
+        print("scan_name,prediction,pred_name,prob_covid,source,status")
         for name, p, prob, src in zip(scan_names, preds, probs, sources):
-            w.writerow([name, int(p), pred_names.get(p, str(p)), f"{prob:.6f}", int(src), "predicted"])
+            print(f"{name},{p},{pred_names.get(p, str(p))},{prob:.6f},{src},predicted")
         for name, reason in skipped:
-            w.writerow([name, "", "", "", -1, f"skipped ({reason})"])
+            print(f"{name},,,,-1,skipped ({reason})")
 
-    print(f"Saved to {args.output}")
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["scan_name", "prediction", "pred_name", "prob_covid", "source", "status"])
+            for name, p, prob, src in zip(scan_names, preds, probs, sources):
+                w.writerow([name, int(p), pred_names.get(p, str(p)), f"{prob:.6f}", int(src), "predicted"])
+            for name, reason in skipped:
+                w.writerow([name, "", "", "", -1, f"skipped ({reason})"])
+        print(f"Saved to {args.output}")
     print(f"  Predicted: {len(scan_names)} (Covid: {(preds == 1).sum()}, Non-Covid: {(preds == 0).sum()})")
     if skipped:
         print(f"  Skipped:   {len(skipped)}")
