@@ -9,7 +9,6 @@ Usage:
 import os
 import sys
 import argparse
-import csv
 
 import numpy as np
 import torch
@@ -151,8 +150,8 @@ def main():
     parser.add_argument("--split", type=str, default="val")
     parser.add_argument("--no-tta", action="store_true", help="Disable TTA")
     parser.add_argument("--no-tune-threshold", action="store_true")
-    parser.add_argument("--output-csv", type=str, default="",
-                        help="Save per-scan CSV: scan_name, label, prediction, prob_covid, correct")
+    parser.add_argument("--print-results", action="store_true",
+                        help="Print per-scan results to log (for copy-paste to notes)")
     args = parser.parse_args()
 
     config_path = args.config or MODEL_CONFIGS[args.model]
@@ -233,22 +232,17 @@ def main():
         print_results(tta_probs, labels, sources, thresh_tta, label=f"TTA n={tta_n}")
         final_probs, final_thresh = tta_probs, thresh_tta
 
-    if args.output_csv:
+    if args.print_results:
         scan_names = [e["scan_name"] for e in val_entries]
         preds = (final_probs >= final_thresh).astype(int)
         correct = (preds == labels)
         label_names = {0: "covid", 1: "non_covid"}
-        os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
-        with open(args.output_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["scan_name", "label", "label_name", "prediction", "pred_name", "prob_covid", "correct", "source"])
-            for name, lab, pred, prob, ok, src in zip(scan_names, labels, preds, final_probs, correct, sources):
-                w.writerow([
-                    name, int(lab), label_names.get(lab, str(lab)),
-                    int(pred), label_names.get(pred, str(pred)),
-                    f"{prob:.6f}", "yes" if ok else "no", int(src)
-                ])
-        print(f"\nSaved per-scan results to {args.output_csv}")
+        print("\n" + "=" * 60)
+        print("PER-SCAN VALIDATION RESULTS (copy below into notes/Excel)")
+        print("=" * 60)
+        print("scan_name,label,label_name,prediction,pred_name,prob_covid,correct,source")
+        for name, lab, pred, prob, ok, src in zip(scan_names, labels, preds, final_probs, correct, sources):
+            print(f"{name},{lab},{label_names.get(lab, str(lab))},{pred},{label_names.get(pred, str(pred))},{prob:.6f},{'yes' if ok else 'no'},{src}")
 
 
 if __name__ == "__main__":
