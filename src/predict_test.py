@@ -125,13 +125,15 @@ def main():
         probs, scan_names = collect_test_probs(model, entries, config, device, use_amp)
 
     preds = (probs >= args.threshold).astype(int)
+    sources = [e["source"] for e in entries]
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    pred_names = {0: "non_covid", 1: "covid"}
     with open(args.output, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["scan_name", "prediction", "prob_covid"])
-        for name, p, prob in zip(scan_names, preds, probs):
-            w.writerow([name, int(p), f"{prob:.6f}"])
+        w.writerow(["scan_name", "prediction", "pred_name", "prob_covid", "source"])
+        for name, p, prob, src in zip(scan_names, preds, probs, sources):
+            w.writerow([name, int(p), pred_names.get(p, str(p)), f"{prob:.6f}", int(src)])
 
     print(f"Saved {len(scan_names)} predictions to {args.output}")
     print(f"  Covid (1): {(preds == 1).sum()}")
