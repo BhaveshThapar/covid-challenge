@@ -2,14 +2,11 @@
 Evaluation script: per-source macro F1, threshold tuning, TTA, and confusion matrices.
 
 Evaluation flow:
-  1. Run scan-level inference without TTA → collect raw sigmoid probs.
+  1. Run TTA inference with N augmentations → collect averaged sigmoid probs.
   2. Tune threshold on val set (sweep 0.30–0.70) → print best threshold + F1.
-  3. If TTA enabled, re-run inference with N augmentations → independently tune threshold again.
-     (TTA shifts the probability distribution, so the optimal threshold differs.)
-  4. Print per-source F1, confusion matrices, final challenge score.
+  3. Print per-source F1, confusion matrices, final challenge score.
 
 Flags:
-  --no-tta             Disable TTA (faster evaluation).
   --no-tune-threshold  Use config threshold (default 0.5) instead of sweeping.
 """
 import os
@@ -25,68 +22,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.model import DenseNetCovidClassifier
 from src.dataset import (
-    build_scan_manifest, ScanDataset, RawSliceScanDataset,
-    get_val_transforms, get_tta_transforms, scan_collate_fn,
+    build_scan_manifest, RawSliceScanDataset,
+    get_tta_transforms,
 )
 from src.utils import (
     load_config, set_seed, compute_per_source_f1,
     print_confusion_matrices, CheckpointManager,
 )
-from torch.utils.data import DataLoader
 
 
 # ---------------------------------------------------------------------------
 # Core inference functions
 # ---------------------------------------------------------------------------
-
-def collect_scan_probs(
-    model: DenseNetCovidClassifier,
-    val_entries: list,
-    config: dict,
-    device,
-    use_amp: bool = True,
-) -> tuple:
-    """
-    Run inference on all validation scans (all slices, no TTA).
-    Returns (probs, labels, sources) as numpy arrays.
-    """
-    img_size = config["data"]["image_size"]
-    val_ds = ScanDataset(
-        val_entries,
-        get_val_transforms(img_size),
-        slices_per_scan=config["eval"]["slices_per_scan"],
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config["eval"]["batch_size"],
-        shuffle=False,
-        num_workers=config["data"]["num_workers"],
-        pin_memory=config["data"]["pin_memory"],
-        collate_fn=scan_collate_fn,
-    )
-
-    model.eval()
-    all_probs, all_labels, all_sources, all_scan_names = [], [], [], []
-
-    with torch.no_grad():
-        for images, labels, sources, masks, scan_names in tqdm(val_loader, desc="Inference"):
-            B, K, C, H, W = images.shape
-            x_flat = images.view(B * K, C, H, W).to(device)
-
-            with autocast(enabled=use_amp):
-                logits = model(x_flat).squeeze(-1)          # (B*K,)
-
-            probs = torch.sigmoid(logits).view(B, K)        # (B, K)
-            valid = masks.float().to(device)                # (B, K)
-            scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)  # (B,)
-
-            all_probs.extend(scan_probs.cpu().numpy())
-            all_labels.extend(labels.numpy())
-            all_sources.extend(sources.numpy())
-            all_scan_names.extend(scan_names)
-
-    return np.array(all_probs), np.array(all_labels), np.array(all_sources), all_scan_names
-
 
 def collect_scan_probs_tta(
     model: DenseNetCovidClassifier,
@@ -280,8 +227,6 @@ def main():
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--metadata-dir", type=str, default="data/metadata")
     parser.add_argument("--split", type=str, default="val")
-    parser.add_argument("--no-tta", action="store_true",
-                        help="Disable TTA (uses config eval.tta_n when not set)")
     parser.add_argument("--no-tune-threshold", action="store_true",
                         help="Use config threshold (default 0.5) instead of sweeping")
     parser.add_argument("--output-csv", type=str, default=None,
@@ -306,41 +251,24 @@ def main():
     lo = eval_cfg.get("threshold_lo", 0.3)
     hi = eval_cfg.get("threshold_hi", 0.7)
     steps = eval_cfg.get("threshold_steps", 41)
-    tta_n = 0 if args.no_tta else eval_cfg.get("tta_n", 4)
+    tta_n = eval_cfg.get("tta_n", 4)
 
-    # ---- Step 1: Inference without TTA ----
-    print("\n--- Running inference (no TTA)...")
-    probs, labels, sources, scan_names = collect_scan_probs(model, val_entries, config, device, use_amp)
+    # ---- TTA inference ----
+    print(f"\n--- Running TTA inference (n={tta_n})...")
+    probs, labels, sources, scan_names = collect_scan_probs_tta(
+        model, val_entries, config, device, tta_n, use_amp
+    )
 
     if args.no_tune_threshold:
-        thresh_base = eval_cfg.get("threshold", 0.5)
-        print(f"Using config threshold: {thresh_base:.2f}")
+        threshold = eval_cfg.get("threshold", 0.5)
+        print(f"Using config threshold: {threshold:.2f}")
     else:
-        thresh_base, f1_tuned = tune_threshold(probs, labels, sources, lo, hi, steps)
-        print(f"Tuned threshold (no TTA): {thresh_base:.2f}  →  avg F1: {f1_tuned:.4f}")
+        threshold, f1_tuned = tune_threshold(probs, labels, sources, lo, hi, steps)
+        print(f"Tuned threshold (TTA): {threshold:.2f}  →  avg F1: {f1_tuned:.4f}")
 
-    print_results(probs, labels, sources, thresh_base, label="No TTA")
-    print_covid_breakdown(probs, labels, sources, scan_names, thresh_base, label="No TTA",
-                          save_csv=args.output_csv)
-
-    # ---- Step 2: TTA inference (if enabled) ----
-    if tta_n > 0:
-        print(f"\n--- Running TTA inference (n={tta_n})...")
-        tta_probs, _, _, tta_scan_names = collect_scan_probs_tta(
-            model, val_entries, config, device, tta_n, use_amp
-        )
-
-        # Independently tune threshold on TTA probabilities (distribution differs from no-TTA)
-        if args.no_tune_threshold:
-            thresh_tta = eval_cfg.get("threshold", 0.5)
-        else:
-            thresh_tta, f1_tta_tuned = tune_threshold(tta_probs, labels, sources, lo, hi, steps)
-            print(f"Tuned threshold (TTA):    {thresh_tta:.2f}  →  avg F1: {f1_tta_tuned:.4f}")
-
-        print_results(tta_probs, labels, sources, thresh_tta, label=f"TTA n={tta_n}")
-        tta_csv = args.output_csv.replace(".csv", "_tta.csv") if args.output_csv else None
-        print_covid_breakdown(tta_probs, labels, sources, tta_scan_names, thresh_tta,
-                              label=f"TTA n={tta_n}", save_csv=tta_csv)
+    print_results(probs, labels, sources, threshold, label=f"TTA n={tta_n}")
+    print_covid_breakdown(probs, labels, sources, scan_names, threshold,
+                          label=f"TTA n={tta_n}", save_csv=args.output_csv)
 
 
 if __name__ == "__main__":
