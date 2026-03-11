@@ -29,7 +29,7 @@ Binary Covid/Non-Covid classification of chest CT scans across four hospital dat
 
 **Model provenance:** The model classes in `src/models/` were extracted from the respective contributor branches:
 - **DINOv2**: `Anant-dev`
-- **DenseNet**: `aadit-dev-v6` (Aadit also has `aadit-dev-v4`; v6 was used for extraction)
+- **DenseNet**: `aadit-dev-v4`
 - **EfficientNet**: `bhavesh/improve-diversity`
 
 They match the original implementations in those branches. Checkpoints are trained separately by each contributor.
@@ -76,12 +76,6 @@ git clone <repo> covid-challenge
 cd covid-challenge
 bash setup_env.sh
 ```
-
-**Checkpoints:**
-- DINOv2: `checkpoints/v1_ovr_best.pt`
-- DenseNet: `v4_ovr_best.pt` (project root or path in config)
-- EfficientNet: `best.pt` from [BhaveshThapar/covid-checkpoints](https://huggingface.co/BhaveshThapar/covid-checkpoints)
-- DenseNet RadImageNet: `checkpoints/radimagenet_densenet121.pt` (for DenseNet init)
 
 **Data:**
 ```bash

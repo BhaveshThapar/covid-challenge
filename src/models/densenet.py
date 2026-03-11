@@ -1,5 +1,6 @@
 """
 Model: DenseNet-121 backbone with RadImageNet pretrained weights for COVID-19 CT slice classification.
+Source: aadit-dev-v4 branch.
 
 Single model class used for both training phases:
   Phase 1: Frozen backbone, head-only fine-tuning
