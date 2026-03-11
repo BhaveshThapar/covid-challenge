@@ -383,7 +383,7 @@ class RawSliceScanDataset(Dataset):
             if arr is not None:
                 raw_imgs.append(arr)
         if not raw_imgs:
-            raw_imgs = [np.zeros((224, 224, 3), dtype=np.uint8)]  # fallback for all-corrupt scan
+            raise ValueError(f"No valid slices in {entry['scan_name']}")
         return raw_imgs, entry["label"], entry["source"]
 
 

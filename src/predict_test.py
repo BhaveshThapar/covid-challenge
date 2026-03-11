@@ -37,18 +37,23 @@ MODEL_CONFIGS = {
 
 
 def _collect_slice_avg(model, entries, config, device, use_amp, tta_n=0):
-    """DINOv2/DenseNet: slice-level sigmoid, scan = mean(slice probs)."""
+    """DINOv2/DenseNet: slice-level sigmoid, scan = mean(slice probs). Returns (probs, names, skipped)."""
     img_size = config["data"]["image_size"]
     k = config["eval"]["slices_per_scan"]
+    skipped = []
 
     if tta_n > 0:
         tta_tfms = get_tta_transforms(img_size)[:tta_n]
         raw_ds = RawSliceScanDataset(entries, slices_per_scan=k if k > 0 else -1)
         model.eval()
-        all_probs = []
+        all_probs, all_names = [], []
         with torch.no_grad():
             for idx in tqdm(range(len(raw_ds)), desc="TTA Inference"):
-                raw_imgs, _, _ = raw_ds[idx]
+                try:
+                    raw_imgs, _, _ = raw_ds[idx]
+                except Exception as e:
+                    skipped.append((entries[idx]["scan_name"], str(e)[:100]))
+                    continue
                 aug_probs = []
                 for tfm in tta_tfms:
                     tensors = torch.stack([tfm(image=img)["image"] for img in raw_imgs]).to(device)
@@ -57,18 +62,25 @@ def _collect_slice_avg(model, entries, config, device, use_amp, tta_n=0):
                     aug_probs.append(torch.sigmoid(logits).cpu().numpy())
                 slice_probs = np.mean(aug_probs, axis=0)
                 all_probs.append(slice_probs.mean())
-        return np.array(all_probs), [e["scan_name"] for e in entries]
+                all_names.append(entries[idx]["scan_name"])
+        return np.array(all_probs) if all_probs else np.array([]), all_names, skipped
 
     ds = ScanDataset(entries, get_val_transforms(img_size), slices_per_scan=k)
     loader = DataLoader(
-        ds, batch_size=config["eval"]["batch_size"], shuffle=False,
-        num_workers=config["data"]["num_workers"], pin_memory=config["data"]["pin_memory"],
-        collate_fn=scan_collate_fn,
+        ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=scan_collate_fn,
     )
     model.eval()
-    all_probs = []
-    with torch.no_grad():
-        for images, _, _, masks in tqdm(loader, desc="Inference"):
+    all_probs, all_names = [], []
+    loader_iter = iter(loader)
+    for idx in tqdm(range(len(entries)), desc="Inference"):
+        try:
+            images, _, _, masks = next(loader_iter)
+        except StopIteration:
+            break
+        except Exception as e:
+            skipped.append((entries[idx]["scan_name"], str(e)[:100]))
+            continue
+        with torch.no_grad():
             B, K, C, H, W = images.shape
             x_flat = images.view(B * K, C, H, W).to(device)
             with autocast(enabled=use_amp):
@@ -76,31 +88,39 @@ def _collect_slice_avg(model, entries, config, device, use_amp, tta_n=0):
             probs = torch.sigmoid(logits).view(B, K)
             valid = masks.float().to(device)
             scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)
-            all_probs.extend(scan_probs.cpu().numpy())
-    return np.array(all_probs), [e["scan_name"] for e in entries]
+            all_probs.append(scan_probs.cpu().item())
+            all_names.append(entries[idx]["scan_name"])
+    return np.array(all_probs) if all_probs else np.array([]), all_names, skipped
 
 
 def _collect_efficientnet(model, entries, config, device, use_amp):
-    """EfficientNet: scan-level (B,K,H,W), softmax, P(covid)=probs[:,0]."""
+    """EfficientNet: scan-level (B,K,H,W), softmax, P(covid)=probs[:,0]. Returns (probs, names, skipped)."""
     img_size = config["data"]["image_size"]
     k = config["eval"]["slices_per_scan"]
     ds = ScanDataset(entries, get_val_transforms(img_size), slices_per_scan=k)
     loader = DataLoader(
-        ds, batch_size=config["eval"]["batch_size"], shuffle=False,
-        num_workers=config["data"]["num_workers"], pin_memory=config["data"]["pin_memory"],
-        collate_fn=scan_collate_fn,
+        ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=scan_collate_fn,
     )
     model.eval()
-    all_probs = []
-    with torch.no_grad():
-        for images, _, _, masks in tqdm(loader, desc="Inference"):
+    all_probs, all_names, skipped = [], [], []
+    loader_iter = iter(loader)
+    for idx in tqdm(range(len(entries)), desc="Inference"):
+        try:
+            images, _, _, masks = next(loader_iter)
+        except StopIteration:
+            break
+        except Exception as e:
+            skipped.append((entries[idx]["scan_name"], str(e)[:100]))
+            continue
+        with torch.no_grad():
             images = images.to(device)
             masks = masks.to(device)
             with autocast(enabled=use_amp):
                 logits, _ = model(images, masks)
-            probs_b = F.softmax(logits, dim=1)[:, 0].cpu().numpy()
-            all_probs.extend(probs_b)
-    return np.array(all_probs), [e["scan_name"] for e in entries]
+            probs_b = F.softmax(logits, dim=1)[:, 0].cpu().item()
+            all_probs.append(probs_b)
+            all_names.append(entries[idx]["scan_name"])
+    return np.array(all_probs) if all_probs else np.array([]), all_names, skipped
 
 
 def main():
@@ -159,22 +179,31 @@ def main():
     print(f"Test scans: {len(entries)}")
 
     if args.model == "efficientnet":
-        probs, scan_names = _collect_efficientnet(model, entries, config, device, use_amp)
+        probs, scan_names, skipped = _collect_efficientnet(model, entries, config, device, use_amp)
     else:
         tta_n = config["eval"].get("tta_n", 4) if args.tta else 0
-        probs, scan_names = _collect_slice_avg(model, entries, config, device, use_amp, tta_n)
+        probs, scan_names, skipped = _collect_slice_avg(model, entries, config, device, use_amp, tta_n)
 
-    preds = (probs >= args.threshold).astype(int)
+    preds = (probs >= args.threshold).astype(int) if len(probs) > 0 else np.array([])
+    pred_names = {0: "non_covid", 1: "covid"}
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["scan_name", "prediction", "prob_covid"])
+        w.writerow(["scan_name", "prediction", "pred_name", "prob_covid", "status"])
         for name, p, prob in zip(scan_names, preds, probs):
-            w.writerow([name, int(p), f"{prob:.6f}"])
+            w.writerow([name, int(p), pred_names.get(p, str(p)), f"{prob:.6f}", "predicted"])
+        for name, reason in skipped:
+            w.writerow([name, "", "", "", f"skipped ({reason})"])
 
-    print(f"Saved {len(scan_names)} predictions to {args.output}")
-    print(f"  Covid (1): {(preds == 1).sum()}, Non-Covid (0): {(preds == 0).sum()}")
+    print(f"Saved to {args.output}")
+    print(f"  Predicted: {len(scan_names)} (Covid: {(preds == 1).sum()}, Non-Covid: {(preds == 0).sum()})")
+    if skipped:
+        print(f"  Skipped:   {len(skipped)}")
+        for name, r in skipped[:5]:
+            print(f"    - {name}: {r[:60]}{'...' if len(r) > 60 else ''}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped) - 5} more")
     print(f"  Threshold: {args.threshold}")
 
 
