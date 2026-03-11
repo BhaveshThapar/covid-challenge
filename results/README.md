@@ -13,7 +13,7 @@ Validation and test results for Anant's DINOv2 ViT-B/14 COVID-19 detector.
 
 - **Architecture**: DINOv2 ViT-B/14 + classifier head  
 - **Checkpoint**: `checkpoints/v1_ovr_best.pt`  
-- **Validation F1 (TTA)**: 0.9053 | No-TTA: 0.9113  
+- **Challenge Score (val, per-source macro F1 avg)**: **0.9113** (no TTA) | 0.9053 (TTA)  
 - **Test**: 1487 scans → 1088 predicted COVID, 399 non-COVID  
 
 ---
