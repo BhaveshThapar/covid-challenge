@@ -3,8 +3,8 @@ Evaluation script: per-source macro F1, threshold tuning, TTA, and confusion mat
 
 Usage:
   python src/evaluate.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt
-  python src/evaluate.py --model densenet --checkpoint v4_ovr_best.pt
-  python src/evaluate.py --model efficientnet --checkpoint best.pt
+  python src/evaluate.py --model densenet --checkpoint checkpoints/v4_ovr_best.pt
+  python src/evaluate.py --model efficientnet --checkpoint checkpoints/best.pt
 """
 import os
 import sys

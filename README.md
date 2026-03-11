@@ -77,6 +77,22 @@ cd covid-challenge
 bash setup_env.sh
 ```
 
+**Cluster setup (mirror local structure):**
+```bash
+# All checkpoints go in checkpoints/
+mkdir -p checkpoints
+
+# EfficientNet: download from HuggingFace
+pip install huggingface_hub
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='BhaveshThapar/covid-checkpoints', filename='best.pt', local_dir='checkpoints')"
+
+# DINOv2: copy from training or scp from local
+# DenseNet: get v4_ovr_best.pt from Aadit, place in checkpoints/
+
+# Or run helper:
+bash scripts/setup_checkpoints_cluster.sh
+```
+
 **Data:**
 ```bash
 sbatch slurm/extract.sbatch
@@ -96,7 +112,7 @@ python src/ensemble.py --split val --tune-weights
 
 # Single-model evaluation
 python src/evaluate.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt
-python src/predict_test.py --model densenet --checkpoint v4_ovr_best.pt --output pred_dense.csv
+python src/predict_test.py --model densenet --checkpoint checkpoints/v4_ovr_best.pt --output pred_dense.csv
 ```
 
 ---
@@ -201,16 +217,16 @@ python src/ensemble.py --weights 0.4 0.3 0.3 --threshold 0.45
 
 ```bash
 python src/predict_test.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt [--tta]
-python src/predict_test.py --model densenet --checkpoint v4_ovr_best.pt --output pred_dense.csv
-python src/predict_test.py --model efficientnet --checkpoint best.pt
+python src/predict_test.py --model densenet --checkpoint checkpoints/v4_ovr_best.pt --output pred_dense.csv
+python src/predict_test.py --model efficientnet --checkpoint checkpoints/best.pt
 ```
 
 ### Single-Model Evaluate
 
 ```bash
 python src/evaluate.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt [--no-tta]
-python src/evaluate.py --model densenet --checkpoint v4_ovr_best.pt
-python src/evaluate.py --model efficientnet --checkpoint best.pt
+python src/evaluate.py --model densenet --checkpoint checkpoints/v4_ovr_best.pt
+python src/evaluate.py --model efficientnet --checkpoint checkpoints/best.pt
 ```
 
 ---
@@ -230,10 +246,10 @@ models:
     checkpoint: checkpoints/v1_ovr_best.pt
   densenet:
     config: configs/densenet.yaml
-    checkpoint: v4_ovr_best.pt
+    checkpoint: checkpoints/v4_ovr_best.pt
   efficientnet:
     config: configs/efficientnet.yaml
-    checkpoint: best.pt
+    checkpoint: checkpoints/best.pt
 ```
 
 ### Model Configs

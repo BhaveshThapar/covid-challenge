@@ -11,7 +11,7 @@ models:
     checkpoint: checkpoints/v1_ovr_best.pt
   densenet:
     config: configs/densenet.yaml
-    checkpoint: v4_ovr_best.pt
+    checkpoint: checkpoints/v4_ovr_best.pt
   efficientnet:
     config: configs/efficientnet.yaml
-    checkpoint: best.pt
+    checkpoint: checkpoints/best.pt

@@ -4,8 +4,8 @@ Outputs a CSV: scan_name, prediction (0=non_covid, 1=covid), prob_covid.
 
 Usage:
   python src/predict_test.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt
-  python src/predict_test.py --model densenet --checkpoint v4_ovr_best.pt --output pred_dense.csv
-  python src/predict_test.py --model efficientnet --checkpoint best.pt
+  python src/predict_test.py --model densenet --checkpoint checkpoints/v4_ovr_best.pt --output pred_dense.csv
+  python src/predict_test.py --model efficientnet --checkpoint checkpoints/best.pt
 """
 import os
 import sys

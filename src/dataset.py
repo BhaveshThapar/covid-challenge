@@ -87,6 +87,14 @@ def _load_image(path: str) -> np.ndarray:
     return np.array(img)
 
 
+def _load_image_safe(path: str) -> Optional[np.ndarray]:
+    """Load image; return None if corrupt/unreadable (skips bad files instead of crashing)."""
+    try:
+        return _load_image(path)
+    except (OSError, Exception):  # OSError covers UnidentifiedImageError
+        return None
+
+
 def _get_sorted_slices(scan_dir: str) -> list:
     """Get sorted list of JPEG slice paths in a scan directory."""
     exts = {".jpg", ".jpeg", ".png"}
@@ -325,14 +333,19 @@ class ScanDataset(Dataset):
         else:
             selected = all_slices
 
-        # Load and transform
+        # Load and transform (skip corrupt images)
         images = []
         for path in selected:
-            img = _load_image(path)
-            if self.transform:
-                img = self.transform(image=img)["image"]
-            images.append(img)
-
+            arr = _load_image_safe(path)
+            if arr is not None:
+                if self.transform:
+                    img = self.transform(image=arr)["image"]
+                else:
+                    img = torch.from_numpy(arr)
+                images.append(img)
+        if not images:
+            gray = np.full((256, 256, 3), 128, dtype=np.uint8)
+            images = [self.transform(image=gray)["image"]]
         images = torch.stack(images)  # (K, 3, H, W)
         label = entry["label"]
         source = entry["source"]
@@ -364,7 +377,13 @@ class RawSliceScanDataset(Dataset):
         else:
             selected = all_slices
 
-        raw_imgs = [_load_image(p) for p in selected]
+        raw_imgs = []
+        for p in selected:
+            arr = _load_image_safe(p)
+            if arr is not None:
+                raw_imgs.append(arr)
+        if not raw_imgs:
+            raw_imgs = [np.zeros((224, 224, 3), dtype=np.uint8)]  # fallback for all-corrupt scan
         return raw_imgs, entry["label"], entry["source"]
 
 
