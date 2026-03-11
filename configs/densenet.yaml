@@ -1,0 +1,19 @@
+# DenseNet-121 + RadImageNet — Aadit
+data:
+  image_size: 224
+  slices_per_scan: 64
+  num_workers: 8
+  pin_memory: true
+model:
+  backbone: "densenet121"
+  pretrained_path: "checkpoints/radimagenet_densenet121.pt"
+  embedding_dim: 1024
+  dropout: 0.4
+phase2:
+  use_amp: true
+eval:
+  slices_per_scan: -1
+  batch_size: 1
+  tta_n: 4
+  threshold: 0.5
+seed: 42

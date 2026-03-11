@@ -1,216 +1,280 @@
-# Multi-Source Covid-19 Detection Challenge
+# Multi-Source COVID-19 Detection — Ensemble
 
-Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
+Binary Covid/Non-Covid classification of chest CT scans across four hospital data sources. This branch combines three independently trained models (DINOv2, DenseNet, EfficientNet) into a weighted ensemble for final predictions.
 
-## Architecture (DINOv2 branch)
+**Challenge metric:** Average macro F1 across the four data centres (per-source macro F1, excluding missing classes).
 
-**DINOv2 ViT-B/14 + slice-level training, scan-level evaluation:**
+---
 
-```
-CT Slices → DINOv2 ViT-B/14 (self-supervised) → Average Slice Probs → Threshold → Covid / Non-Covid
-```
+## Table of Contents
 
-Training uses progressive backbone unfreezing (Phase 1: frozen; Phase 2a: last 2 blocks; Phase 2b: last 4 blocks).
-Scan-level predictions average per-slice sigmoid probabilities (no learned attention).
+1. [Models](#models)
+2. [Project Structure](#project-structure)
+3. [Setup](#setup)
+4. [Quick Start](#quick-start)
+5. [Ensemble Deep Dive](#ensemble-deep-dive)
+6. [Usage Reference](#usage-reference)
+7. [Config Reference](#config-reference)
+8. [Known Issues](#known-issues)
 
-**Metric:** Average macro F1 across 4 data centres
+---
+
+## Models
+
+| Model | Backbone | Architecture | Image Size | Contributor |
+|-------|----------|--------------|------------|-------------|
+| **DINOv2** | ViT-B/14 (self-supervised, torch.hub) | Slice-level sigmoid → scan avg | 224×224 | Anant |
+| **DenseNet** | DenseNet-121 (RadImageNet) | Slice-level sigmoid → scan avg | 224×224 | Aadit |
+| **EfficientNet** | EfficientNet-B3 (timm) + Attention MIL | Scan-level softmax | 256×256 | Bhavesh |
+
+**Model provenance:** The model classes in `src/models/` were extracted from the respective contributor branches:
+- **DINOv2**: `Anant-dev`
+- **DenseNet**: `aadit-dev-v6` (Aadit also has `aadit-dev-v4`; v6 was used for extraction)
+- **EfficientNet**: `bhavesh/improve-diversity`
+
+They match the original implementations in those branches. Checkpoints are trained separately by each contributor.
+
+---
 
 ## Project Structure
 
 ```
 covid-challenge/
 ├── src/
-│   ├── model.py       # DINOv2CovidClassifier (DINOv2 ViT-B/14)
-│   ├── dataset.py     # SliceDataset, ScanDataset, CenterBatchSampler, TTA transforms
-│   ├── train.py       # Phase 1 (frozen) + Phase 2 (gradual unfreeze) training
-│   ├── evaluate.py    # Scan-level inference, threshold tuning, TTA, per-source F1
-│   └── utils.py       # Metrics, checkpointing, early stopping
-├── scripts/
-│   └── download_and_extract.py  # gdown download + archive extraction + dataset analysis
-├── slurm/
-│   ├── extract.sbatch    # Data download/extraction SLURM job (tron partition)
-│   └── train.sbatch      # GPU training SLURM job (tron partition, qos=medium)
+│   ├── models/              # Modular model definitions
+│   │   ├── dinov2.py        # DINOv2CovidClassifier
+│   │   ├── densenet.py      # DenseNetCovidClassifier
+│   │   └── efficientnet.py  # CovidDetector, SliceClassifier, AttentionPooling
+│   ├── model.py             # Re-exports (backward compat)
+│   ├── dataset.py           # ScanDataset, transforms, manifests
+│   ├── ensemble.py          # Multi-GPU ensemble inference + validation
+│   ├── predict_test.py      # Single-model test inference
+│   ├── evaluate.py          # Single-model evaluation
+│   └── utils.py             # Metrics, checkpointing
 ├── configs/
-│   └── default.yaml      # Hyperparameters
-└── setup_env.sh           # Environment setup
+│   ├── ensemble.yaml        # Ensemble weights, checkpoint paths
+│   ├── dinov2.yaml
+│   ├── densenet.yaml
+│   └── efficientnet.yaml
+├── slurm/
+│   ├── extract.sbatch       # Data download/extraction
+│   ├── test.sbatch          # Single-model test (DINOv2)
+│   ├── eval.sbatch          # Single-model evaluation
+│   ├── ensemble.sbatch      # Ensemble prediction on test (3 GPUs)
+│   └── ensemble_val.sbatch  # Ensemble on val + weight tuning
+└── scripts/
+    └── download_and_extract.py
 ```
 
-## Setup (on Nexus cluster)
+---
+
+## Setup
 
 ```bash
-# 1. Clone the Anant-dev branch
-cd /fs/nexus-scratch/anant04
-git clone -b Anant-dev https://github.com/BhaveshThapar/covid-challenge.git covid-challenge
+cd /fs/nexus-scratch/anant04  # or your cluster path
+git clone <repo> covid-challenge
 cd covid-challenge
-
-# 2. Create environment
 bash setup_env.sh
-
-# DINOv2 weights are downloaded automatically via torch.hub on first run (no manual download).
 ```
 
-## Data
+**Checkpoints:**
+- DINOv2: `checkpoints/v1_ovr_best.pt`
+- DenseNet: `v4_ovr_best.pt` (project root or path in config)
+- EfficientNet: `best.pt` from [BhaveshThapar/covid-checkpoints](https://huggingface.co/BhaveshThapar/covid-checkpoints)
+- DenseNet RadImageNet: `checkpoints/radimagenet_densenet121.pt` (for DenseNet init)
 
-Data is downloaded from Google Drive via gdown — no manual file placement needed.
-
+**Data:**
 ```bash
-# Extract data (submit SLURM job — tron partition, ~1-6 hours)
 sbatch slurm/extract.sbatch
 ```
+Expected layout: `data/{train,val,test}/{covid,non_covid}/` with `ct_scan_*` subdirs of JPEG slices; metadata CSVs in `datasets/`.
 
-Expected structure after extraction:
-```
-data/
-├── train/
-│   ├── covid/          # ct_scan_*/  folders of JPEG slices
-│   └── non_covid/
-└── val/
-    ├── covid/
-    └── non_covid/
+---
 
-datasets/               # metadata CSVs live here (alongside raw archives)
-├── train_covid.csv
-├── train_non_covid.csv
-├── validation_covid.csv       # NOTE: named "validation_", not "val_"
-└── validation_non_covid.csv   # code handles both automatically
-```
-
-> **Note:** The metadata CSVs are in `datasets/` (alongside the raw archive files), **not**
-> `data/metadata/`. Always pass `--metadata-dir datasets` to train.py and evaluate.py.
-> The validation CSV names use `validation_*.csv`; the code tries `val_*.csv` first and
-> falls back to `validation_*.csv` automatically.
-
-## Training
+## Quick Start
 
 ```bash
-# Submit full training job (Phase 1 → Phase 2 sequentially):
-sbatch slurm/train.sbatch
+# Ensemble prediction on test set (3 GPUs)
+sbatch slurm/ensemble.sbatch
 
-# Or submit Phase 2 only (if phase1_best.pt already exists):
-BASH_ENV=/usr/share/Modules/init/bash sbatch \
-  --job-name=covid-phase2 \
-  --partition=tron --account=nexus --qos=medium \
-  --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=10:00:00 \
-  --output=logs/phase2_%j.out --error=logs/phase2_%j.err \
-  --wrap='cd /fs/nexus-scratch/anant04/covid-challenge &&
-          source /usr/share/Modules/init/bash &&
-          module load Python3/3.10.14 &&
-          source venv/bin/activate &&
-          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-          python -u src/train.py --config configs/default.yaml \
-            --data-dir data --metadata-dir datasets --phase 2'
+# Ensemble on validation with weight tuning
+python src/ensemble.py --split val --tune-weights
 
-# Run directly (debug / local):
-python src/train.py --config configs/default.yaml --phase 0
+# Single-model evaluation
+python src/evaluate.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt
+python src/predict_test.py --model densenet --checkpoint v4_ovr_best.pt --output pred_dense.csv
 ```
 
-> **Partition:** Use `tron --qos=medium` (not `scavenger`) for training. Tron gives newer GPUs
-> (no preemption) and `--qos=medium` is required to get 8 CPUs + 64 GB RAM
-> (default QoS caps at 4 CPUs / 32 GB which is insufficient for `num_workers=8`).
+---
 
-Training phases:
-- **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
-- **Phase 2a** (epochs 1–15): Unfreeze last 2 blocks + norm, lr=1e-4
-- **Phase 2b** (epochs 1–15): Unfreeze last 4 blocks + norm, lr=5e-5
+## Ensemble Deep Dive
 
-Checkpoints: `checkpoints/{run_name}_phase1_best.pt`, `{run_name}_phase2a_best.pt`, `{run_name}_phase2b_best.pt`, `{run_name}_ovr_best.pt`
+### Pipeline Overview
 
-## Evaluation
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     MAIN PROCESS                                         │
+│  1. Load config (weights, checkpoint paths)                              │
+│  2. Spawn 3 worker processes (one per model)                             │
+│  3. Each worker: CUDA_VISIBLE_DEVICES = gpu_id, load model, run inference│
+│  4. Collect (scan_names, prob_covid) from each via Queue                 │
+│  5. Merge: prob_ens = w1·P_dino + w2·P_dense + w3·P_eff                  │
+│  6. preds = (prob_ens >= threshold).astype(int)                         │
+│  7. Write CSV                                                            │
+└─────────────────────────────────────────────────────────────────────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+   GPU 0: DINOv2        GPU 1: DenseNet      GPU 2: EfficientNet
+```
+
+Inference runs in parallel; wall time is about the slowest model.
+
+### How Each Model Produces P(covid)
+
+| Model | Output | Conversion |
+|-------|--------|------------|
+| DINOv2 | (B, 1) logits per slice | sigmoid → mean over slices (optionally TTA) |
+| DenseNet | (B, 1) logits per slice | sigmoid → mean over slices (optionally TTA) |
+| EfficientNet | (B, 2) logits per scan | softmax → `probs[:, 0]` (class 0 = covid) |
+
+All outputs are P(covid) in [0, 1], so weighted averaging is consistent.
+
+### Weights and Threshold
+
+- **Default:** `[0.33, 0.33, 0.34]`, threshold 0.5 (in `configs/ensemble.yaml`)
+- **Override:** `--weights 0.4 0.3 0.3` (normalized automatically)
+- **Tuning:** `--split val --tune-weights` runs a grid search over weights and threshold to maximize validation F1
+
+### Per-Source Threshold
+
+The challenge metric averages macro F1 across sources. Using a different threshold per source can improve it:
 
 ```bash
-python src/evaluate.py \
-    --config configs/default.yaml \
-    --checkpoint checkpoints/v1_ovr_best.pt \
-    --data-dir data \
-    --metadata-dir datasets
+python src/ensemble.py --split val --per-source-threshold
 ```
 
-Outputs per-source F1, tuned threshold, and final challenge score:
-```
-=======================================================
-PER-SOURCE MACRO F1 SCORES [No TTA]
-=======================================================
-    source_0: 0.xxxx
-    source_1: 0.xxxx
-    source_2: 0.xxxx
-    source_3: 0.xxxx
-     average: 0.xxxx  ★
+### Validation Mode
 
-Tuned threshold (TTA):  0.xx  →  avg F1: 0.xxxx
+With `--split val` the ensemble uses the validation set (labels available) and reports:
 
-Final Challenge Score (P): 0.xxxx
-```
-
-Flags:
-- `--no-tta` — skip TTA (faster)
-- `--no-tune-threshold` — use default threshold of 0.5
-
-## Key Hyperparameters
-
-| Parameter | Value |
-|-----------|-------|
-| Backbone | DINOv2 ViT-B/14 (self-supervised, torch.hub) |
-| Image size | 224×224 |
-| Slices/scan (training) | 64 (uniform sample) |
-| Slices/scan (fast val) | 48 |
-| Phase 1 LR | 1e-3 (head only) |
-| Phase 2a LR | 1e-4 (blocks 10–11, norm) |
-| Phase 2b LR | 5e-5 (blocks 8–9) |
-| Loss | BCEWithLogitsLoss + label smoothing (ε=0.05) |
-| Grad clipping | max_norm=1.0 |
-| Batch sampler | Center-stratified (equal center representation) |
-| Threshold | Tuned on val (0.30–0.70 sweep) |
-| TTA | 4 augmentations (identity, hflip, rotate ±15°) |
-| Early stopping patience | 10 epochs |
-| AMP | bfloat16 on Ampere GPUs; falls back to float32 on Turing/Pascal |
-| Eval batch size | 1 scan at a time (prevents OOM on full-slice eval) |
-
-## Known Issues & Cluster Notes
-
-| Issue | Fix applied |
-|-------|-------------|
-| `val_covid.csv` not found (all sources = -1) | Code now tries `validation_*.csv` as fallback |
-| `FileNotFoundError: phase1_best.pt` (checkpoint rotation) | `save_named()` bypasses max_keep rotation |
-| `UnpicklingError` loading checkpoints (PyTorch 2.6) | `weights_only=False` in `CheckpointManager.load()` |
-| NaN loss in Phase 2 (float16 overflow) | AMP uses bfloat16; falls back to float32 if unsupported |
-| OOM on full-slice validation (V100, 16 GB) | `full_val_every_n_epochs: 999`; `eval.batch_size: 1` |
-| 1-2 missing scan directories | Logged at startup, training continues without them |
-
-## Test Set Inference
-
-The 1st challenge test set is included in the download script. After extraction, `data/test/` contains unlabeled scans.
+- Per-source macro F1
+- Confusion matrices per source
+- Challenge score (average F1)
 
 ```bash
-# 1. Extract data (includes test) if not done:
-sbatch slurm/extract.sbatch
-
-# 2. Run test predictions (downloads test if missing, then predicts):
-sbatch slurm/test.sbatch
+python src/ensemble.py --split val
+python src/ensemble.py --split val --tune-weights --per-source-threshold
 ```
 
-Output: `predictions_test.csv` with columns `scan_name`, `prediction` (0=non_covid, 1=covid), `prob_covid`.
+### Workflow Summary
 
-To use TTA or a custom threshold:
+1. Ensure all three checkpoints are present and paths in `configs/ensemble.yaml` are correct.
+2. Run validation ensemble to inspect performance:
+   ```bash
+   python src/ensemble.py --split val --tune-weights
+   ```
+3. Update `configs/ensemble.yaml` with the printed weights (or use `--weights` on the command line).
+4. Run test ensemble:
+   ```bash
+   sbatch slurm/ensemble.sbatch
+   ```
+5. Submit `predictions_ensemble.csv` to the challenge.
+
+---
+
+## Usage Reference
+
+### Ensemble
+
 ```bash
-python src/predict_test.py --checkpoint checkpoints/v1_ovr_best.pt \
-    --output predictions_test.csv --threshold 0.5 --tta
+# Test set (default)
+python src/ensemble.py [--output predictions_ensemble.csv]
+
+# Validation set (with F1 report)
+python src/ensemble.py --split val
+
+# Tune weights and threshold on validation
+python src/ensemble.py --split val --tune-weights
+
+# Per-source threshold sweep
+python src/ensemble.py --split val --per-source-threshold
+
+# Override weights / threshold
+python src/ensemble.py --weights 0.4 0.3 0.3 --threshold 0.45
 ```
 
-## Updating from Laptop → Nexus
+### Single-Model Predict
 
 ```bash
-# Laptop: make changes, commit, push
-git add -p && git commit -m "..." && git push
-
-# Nexus: pull latest
-cd /fs/nexus-scratch/anant04/covid-challenge
-git pull
-sbatch slurm/train.sbatch
+python src/predict_test.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt [--tta]
+python src/predict_test.py --model densenet --checkpoint v4_ovr_best.pt --output pred_dense.csv
+python src/predict_test.py --model efficientnet --checkpoint best.pt
 ```
+
+### Single-Model Evaluate
+
+```bash
+python src/evaluate.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt [--no-tta]
+python src/evaluate.py --model densenet --checkpoint v4_ovr_best.pt
+python src/evaluate.py --model efficientnet --checkpoint best.pt
+```
+
+---
+
+## Config Reference
+
+### `configs/ensemble.yaml`
+
+```yaml
+ensemble:
+  weights: [0.33, 0.33, 0.34]   # [dinov2, densenet, efficientnet]
+  threshold: 0.5
+
+models:
+  dinov2:
+    config: configs/dinov2.yaml
+    checkpoint: checkpoints/v1_ovr_best.pt
+  densenet:
+    config: configs/densenet.yaml
+    checkpoint: v4_ovr_best.pt
+  efficientnet:
+    config: configs/efficientnet.yaml
+    checkpoint: best.pt
+```
+
+### Model Configs
+
+Each model has its own config for image size, `slices_per_scan`, TTA, etc. DINOv2 and DenseNet use 224×224; EfficientNet uses 256×256. DINOv2 and DenseNet use TTA (4 augs) in the ensemble; EfficientNet does not.
+
+---
+
+## Optimization and Tuning
+
+| Option | Description |
+|--------|-------------|
+| `--tune-weights` | Grid search over weights and threshold to maximize val F1 |
+| `--per-source-threshold` | Sweep a separate threshold per data source |
+| `--weights w1 w2 w3` | Manual weight override (normalized to sum=1) |
+| `--threshold t` | Override classification threshold |
+
+Recommended workflow: run `--split val --tune-weights` to find best weights, then update `configs/ensemble.yaml` or pass `--weights` for test inference.
+
+---
+
+## Known Issues
+
+| Issue | Notes |
+|-------|-------|
+| Metadata path | Use `--metadata-dir datasets` (not `data/metadata`) |
+| DenseNet RadImageNet | Set `pretrained_path` in `configs/densenet.yaml`; if missing, trains from scratch |
+| Empty val/test | Run `sbatch slurm/extract.sbatch` first |
+| 3 GPUs required | Ensemble needs 3 GPUs; adjust `--gpus` if your machine differs |
+
+---
 
 ## Requirements
 
 - Python 3.10+
-- PyTorch 2.6+ + CUDA 11.8
-- SLURM cluster with GPU (tested on UMD Nexus, `tron` partition, qos=medium)
-- `unrar` system module: `module load unrar/7.0.9`
+- PyTorch 2.x + CUDA
+- albumentations, timm, torchvision, sklearn
+- SLURM (for cluster jobs)

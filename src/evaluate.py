@@ -1,16 +1,10 @@
 """
 Evaluation script: per-source macro F1, threshold tuning, TTA, and confusion matrices.
 
-Evaluation flow:
-  1. Run scan-level inference without TTA → collect raw sigmoid probs.
-  2. Tune threshold on val set (sweep 0.30–0.70) → print best threshold + F1.
-  3. If TTA enabled, re-run inference with N augmentations → independently tune threshold again.
-     (TTA shifts the probability distribution, so the optimal threshold differs.)
-  4. Print per-source F1, confusion matrices, final challenge score.
-
-Flags:
-  --no-tta             Disable TTA (faster evaluation).
-  --no-tune-threshold  Use config threshold (default 0.5) instead of sweeping.
+Usage:
+  python src/evaluate.py --model dinov2 --checkpoint checkpoints/v1_ovr_best.pt
+  python src/evaluate.py --model densenet --checkpoint v4_ovr_best.pt
+  python src/evaluate.py --model efficientnet --checkpoint best.pt
 """
 import os
 import sys
@@ -18,12 +12,13 @@ import argparse
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.model import DINOv2CovidClassifier
+from src.models import DINOv2CovidClassifier, DenseNetCovidClassifier, CovidDetector
 from src.dataset import (
     build_scan_manifest, ScanDataset, RawSliceScanDataset,
     get_val_transforms, get_tta_transforms, scan_collate_fn,
@@ -35,122 +30,87 @@ from src.utils import (
 from torch.utils.data import DataLoader
 
 
-# ---------------------------------------------------------------------------
-# Core inference functions
-# ---------------------------------------------------------------------------
+MODEL_CONFIGS = {
+    "dinov2": "configs/dinov2.yaml",
+    "densenet": "configs/densenet.yaml",
+    "efficientnet": "configs/efficientnet.yaml",
+}
 
-def collect_scan_probs(
-    model: DINOv2CovidClassifier,
-    val_entries: list,
-    config: dict,
-    device,
-    use_amp: bool = True,
-) -> tuple:
-    """
-    Run inference on all validation scans (all slices, no TTA).
-    Returns (probs, labels, sources) as numpy arrays.
-    """
+
+def collect_scan_probs_slice_avg(model, val_entries, config, device, use_amp, tta_n=0):
+    """DINOv2/DenseNet: slice-level sigmoid, scan = mean(slice probs)."""
     img_size = config["data"]["image_size"]
-    val_ds = ScanDataset(
-        val_entries,
-        get_val_transforms(img_size),
-        slices_per_scan=config["eval"]["slices_per_scan"],
-    )
+    k = config["eval"]["slices_per_scan"]
+
+    if tta_n > 0:
+        tta_tfms = get_tta_transforms(img_size)[:tta_n]
+        raw_ds = RawSliceScanDataset(val_entries, slices_per_scan=k if k > 0 else -1)
+        model.eval()
+        all_probs, all_labels, all_sources = [], [], []
+        for idx in tqdm(range(len(raw_ds)), desc=f"TTA n={tta_n}"):
+            raw_imgs, label, source = raw_ds[idx]
+            aug_probs = []
+            for tfm in tta_tfms:
+                tensors = torch.stack([tfm(image=img)["image"] for img in raw_imgs]).to(device)
+                with torch.no_grad():
+                    with autocast(enabled=use_amp):
+                        logits = model(tensors).squeeze(-1)
+                aug_probs.append(torch.sigmoid(logits).cpu().numpy())
+            slice_probs = np.mean(aug_probs, axis=0)
+            all_probs.append(slice_probs.mean())
+            all_labels.append(label)
+            all_sources.append(source)
+        return np.array(all_probs), np.array(all_labels), np.array(all_sources)
+
+    val_ds = ScanDataset(val_entries, get_val_transforms(img_size), slices_per_scan=k)
     val_loader = DataLoader(
-        val_ds,
-        batch_size=config["eval"]["batch_size"],
-        shuffle=False,
-        num_workers=config["data"]["num_workers"],
-        pin_memory=config["data"]["pin_memory"],
+        val_ds, batch_size=config["eval"]["batch_size"], shuffle=False,
+        num_workers=config["data"]["num_workers"], pin_memory=config["data"]["pin_memory"],
         collate_fn=scan_collate_fn,
     )
-
     model.eval()
     all_probs, all_labels, all_sources = [], [], []
-
     with torch.no_grad():
         for images, labels, sources, masks in tqdm(val_loader, desc="Inference"):
             B, K, C, H, W = images.shape
             x_flat = images.view(B * K, C, H, W).to(device)
-
             with autocast(enabled=use_amp):
-                logits = model(x_flat).squeeze(-1)          # (B*K,)
-
-            probs = torch.sigmoid(logits).view(B, K)        # (B, K)
-            valid = masks.float().to(device)                # (B, K)
-            scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)  # (B,)
-
+                logits = model(x_flat).squeeze(-1)
+            probs = torch.sigmoid(logits).view(B, K)
+            valid = masks.float().to(device)
+            scan_probs = (probs * valid).sum(1) / valid.sum(1).clamp(min=1)
             all_probs.extend(scan_probs.cpu().numpy())
             all_labels.extend(labels.numpy())
             all_sources.extend(sources.numpy())
-
     return np.array(all_probs), np.array(all_labels), np.array(all_sources)
 
 
-def collect_scan_probs_tta(
-    model: DINOv2CovidClassifier,
-    val_entries: list,
-    config: dict,
-    device,
-    tta_n: int = 4,
-    use_amp: bool = True,
-) -> tuple:
-    """
-    Run TTA inference on all validation scans.
-    For each scan: load raw slice arrays once, apply N transform pipelines,
-    average sigmoid probs across augmentations, then average across slices.
-
-    Returns (probs, labels, sources) as numpy arrays.
-    """
+def collect_scan_probs_efficientnet(model, val_entries, config, device, use_amp):
+    """EfficientNet: scan-level, softmax, P(covid)=probs[:,0]."""
     img_size = config["data"]["image_size"]
-    tta_tfms = get_tta_transforms(img_size)[:tta_n]
     k = config["eval"]["slices_per_scan"]
-
-    raw_ds = RawSliceScanDataset(val_entries, slices_per_scan=k)
-
+    val_ds = ScanDataset(val_entries, get_val_transforms(img_size), slices_per_scan=k)
+    val_loader = DataLoader(
+        val_ds, batch_size=config["eval"]["batch_size"], shuffle=False,
+        num_workers=config["data"]["num_workers"], pin_memory=config["data"]["pin_memory"],
+        collate_fn=scan_collate_fn,
+    )
     model.eval()
     all_probs, all_labels, all_sources = [], [], []
-
-    for idx in tqdm(range(len(raw_ds)), desc=f"TTA Inference (n={tta_n})"):
-        raw_imgs, label, source = raw_ds[idx]   # list of np.ndarray, int, int
-        n_slices = len(raw_imgs)
-
-        aug_probs = []  # one entry per TTA augmentation, shape (n_slices,)
-        for tfm in tta_tfms:
-            tensors = torch.stack([tfm(image=img)["image"] for img in raw_imgs])  # (K, 3, H, W)
-            tensors = tensors.to(device)
-
-            with torch.no_grad():
-                with autocast(enabled=use_amp):
-                    logits = model(tensors).squeeze(-1)   # (K,)
-            aug_probs.append(torch.sigmoid(logits).cpu().numpy())
-
-        # Average across TTA augmentations, then average across slices
-        slice_probs = np.mean(aug_probs, axis=0)   # (K,)
-        scan_prob = slice_probs.mean()
-        all_probs.append(scan_prob)
-        all_labels.append(label)
-        all_sources.append(source)
-
+    with torch.no_grad():
+        for images, labels, sources, masks in tqdm(val_loader, desc="Inference"):
+            images = images.to(device)
+            masks = masks.to(device)
+            with autocast(enabled=use_amp):
+                logits, _ = model(images, masks)
+            probs_b = F.softmax(logits, dim=1)[:, 0].cpu().numpy()
+            all_probs.extend(probs_b)
+            all_labels.extend(labels.numpy())
+            all_sources.extend(sources.numpy())
     return np.array(all_probs), np.array(all_labels), np.array(all_sources)
 
 
-# ---------------------------------------------------------------------------
-# Threshold tuning
-# ---------------------------------------------------------------------------
-
-def tune_threshold(
-    probs: np.ndarray,
-    labels: np.ndarray,
-    sources: np.ndarray,
-    lo: float = 0.3,
-    hi: float = 0.7,
-    steps: int = 41,
-) -> tuple:
-    """
-    Sweep thresholds and return (best_threshold, best_avg_f1).
-    Optimises the per-source averaged F1 (the challenge metric).
-    """
+def tune_threshold(probs, labels, sources, lo=0.3, hi=0.7, steps=41):
     best_t, best_f1 = 0.5, 0.0
     for t in np.linspace(lo, hi, steps):
         preds = (probs >= t).astype(int)
@@ -160,21 +120,10 @@ def tune_threshold(
     return best_t, best_f1
 
 
-# ---------------------------------------------------------------------------
-# Reporting helpers
-# ---------------------------------------------------------------------------
-
-def print_results(
-    probs: np.ndarray,
-    labels: np.ndarray,
-    sources: np.ndarray,
-    threshold: float,
-    label: str = "",
-):
+def print_results(probs, labels, sources, threshold, label=""):
     preds = (probs >= threshold).astype(int)
     f1_dict = compute_per_source_f1(labels, preds, sources, exclude_missing_classes=True)
     f1_legacy = compute_per_source_f1(labels, preds, sources, exclude_missing_classes=False)
-
     tag = f" [{label}]" if label else ""
     print(f"\n{'='*55}")
     print(f"PER-SOURCE MACRO F1 SCORES{tag}")
@@ -183,43 +132,61 @@ def print_results(
         marker = "  ★" if k == "average" else ""
         print(f"  {k:>12}: {v:.4f}{marker}")
     print(f"  [legacy: both classes, missing=0]: avg = {f1_legacy['average']:.4f}")
-
     print_confusion_matrices(labels, preds, sources)
-
     acc = (preds == labels).mean()
     print(f"\nOverall accuracy: {acc:.4f}")
     print(f"Final Challenge Score (P): {f1_dict['average']:.4f}")
     return f1_dict
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate DINOv2 ViT-B/14 Covid-19 Detector")
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser = argparse.ArgumentParser(description="Evaluate COVID-19 Detector")
+    parser.add_argument("--model", type=str, choices=["dinov2", "densenet", "efficientnet"],
+                        default="dinov2")
+    parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--metadata-dir", type=str, default="data/metadata")
+    parser.add_argument("--metadata-dir", type=str, default="datasets")
     parser.add_argument("--split", type=str, default="val")
-    parser.add_argument("--no-tta", action="store_true",
-                        help="Disable TTA (uses config eval.tta_n when not set)")
-    parser.add_argument("--no-tune-threshold", action="store_true",
-                        help="Use config threshold (default 0.5) instead of sweeping")
+    parser.add_argument("--no-tta", action="store_true", help="Disable TTA")
+    parser.add_argument("--no-tune-threshold", action="store_true")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config_path = args.config or MODEL_CONFIGS[args.model]
+    config = load_config(config_path)
     set_seed(config["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = config.get("phase2", {}).get("use_amp", True)
 
-    # Model
-    model = DINOv2CovidClassifier(dropout=config["model"]["dropout"]).to(device)
-    epoch, score = CheckpointManager.load(args.checkpoint, model, device=device)
-    print(f"Loaded checkpoint from epoch {epoch}, training score={score:.4f}")
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ckpt = args.checkpoint if os.path.isabs(args.checkpoint) else os.path.join(base, args.checkpoint)
 
-    # Data
+    # Build model
+    if args.model == "dinov2":
+        model = DINOv2CovidClassifier(dropout=config["model"]["dropout"]).to(device)
+    elif args.model == "densenet":
+        pretrained = config["model"].get("pretrained_path", "")
+        pretrained = os.path.join(base, pretrained) if pretrained and not os.path.isabs(pretrained) else pretrained
+        model = DenseNetCovidClassifier(
+            pretrained_path=pretrained if pretrained and os.path.exists(pretrained) else None,
+            dropout=config["model"]["dropout"],
+        ).to(device)
+    else:  # efficientnet
+        cfg = config["model"]
+        model = CovidDetector(
+            backbone_name=cfg["backbone"],
+            pretrained=False,
+            embedding_dim=cfg["embedding_dim"],
+            attention_hidden_dim=cfg["attention_hidden_dim"],
+            classifier_hidden_dim=cfg["classifier_hidden_dim"],
+            num_classes=cfg["num_classes"],
+            dropout=cfg["dropout"],
+            drop_path_rate=cfg.get("drop_path_rate", 0.0),
+        ).to(device)
+
+    epoch, score = CheckpointManager.load(ckpt, model, device=device)
+    print(f"Loaded {args.model} checkpoint (epoch {epoch}, score={score:.4f})")
+
     val_entries = build_scan_manifest(args.data_dir, args.split, args.metadata_dir)
     print(f"Val scans: {len(val_entries)}")
 
@@ -227,33 +194,38 @@ def main():
     lo = eval_cfg.get("threshold_lo", 0.3)
     hi = eval_cfg.get("threshold_hi", 0.7)
     steps = eval_cfg.get("threshold_steps", 41)
-    tta_n = 0 if args.no_tta else eval_cfg.get("tta_n", 4)
+    tta_n = 0 if args.no_tta else eval_cfg.get("tta_n", eval_cfg.get("tta", False) and 4 or 0)
+    if isinstance(tta_n, bool):
+        tta_n = 4 if tta_n else 0
 
-    # ---- Step 1: Inference without TTA ----
-    print("\n--- Running inference (no TTA)...")
-    probs, labels, sources = collect_scan_probs(model, val_entries, config, device, use_amp)
+    # Inference
+    if args.model == "efficientnet":
+        probs, labels, sources = collect_scan_probs_efficientnet(model, val_entries, config, device, use_amp)
+        tta_n = 0  # EfficientNet TTA handled differently; skip for now
+    else:
+        probs, labels, sources = collect_scan_probs_slice_avg(
+            model, val_entries, config, device, use_amp, tta_n=0
+        )
 
     if args.no_tune_threshold:
-        thresh_base = eval_cfg.get("threshold", 0.5)
-        print(f"Using config threshold: {thresh_base:.2f}")
+        thresh = eval_cfg.get("threshold", 0.5)
+        print(f"Using threshold: {thresh:.2f}")
     else:
-        thresh_base, f1_tuned = tune_threshold(probs, labels, sources, lo, hi, steps)
-        print(f"Tuned threshold (no TTA): {thresh_base:.2f}  →  avg F1: {f1_tuned:.4f}")
+        thresh, f1 = tune_threshold(probs, labels, sources, lo, hi, steps)
+        print(f"Tuned threshold: {thresh:.2f}  →  avg F1: {f1:.4f}")
 
-    print_results(probs, labels, sources, thresh_base, label="No TTA")
+    print_results(probs, labels, sources, thresh, label="No TTA")
 
-    # ---- Step 2: TTA inference (if enabled) ----
-    if tta_n > 0:
-        print(f"\n--- Running TTA inference (n={tta_n})...")
-        tta_probs, _, _ = collect_scan_probs_tta(model, val_entries, config, device, tta_n, use_amp)
-
-        # Independently tune threshold on TTA probabilities (distribution differs from no-TTA)
+    if tta_n > 0 and args.model != "efficientnet":
+        print(f"\n--- TTA inference (n={tta_n})...")
+        tta_probs, _, _ = collect_scan_probs_slice_avg(
+            model, val_entries, config, device, use_amp, tta_n=tta_n
+        )
         if args.no_tune_threshold:
             thresh_tta = eval_cfg.get("threshold", 0.5)
         else:
-            thresh_tta, f1_tta_tuned = tune_threshold(tta_probs, labels, sources, lo, hi, steps)
-            print(f"Tuned threshold (TTA):    {thresh_tta:.2f}  →  avg F1: {f1_tta_tuned:.4f}")
-
+            thresh_tta, f1_tta = tune_threshold(tta_probs, labels, sources, lo, hi, steps)
+            print(f"TTA tuned threshold: {thresh_tta:.2f}  →  avg F1: {f1_tta:.4f}")
         print_results(tta_probs, labels, sources, thresh_tta, label=f"TTA n={tta_n}")
 
 

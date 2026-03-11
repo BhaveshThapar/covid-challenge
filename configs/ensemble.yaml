@@ -1,0 +1,17 @@
+# Ensemble configuration — Multi-Source COVID-19 Detection
+# Weighted average of DINOv2, DenseNet, EfficientNet
+
+ensemble:
+  weights: [0.33, 0.33, 0.34]   # [dinov2, densenet, efficientnet] — tune on val
+  threshold: 0.5
+
+models:
+  dinov2:
+    config: configs/dinov2.yaml
+    checkpoint: checkpoints/v1_ovr_best.pt
+  densenet:
+    config: configs/densenet.yaml
+    checkpoint: v4_ovr_best.pt
+  efficientnet:
+    config: configs/efficientnet.yaml
+    checkpoint: best.pt

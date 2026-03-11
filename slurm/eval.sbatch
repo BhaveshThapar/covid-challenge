@@ -28,7 +28,7 @@ echo "Start: $(date)"
 echo "================"
 
 python src/evaluate.py \
-    --config configs/default.yaml \
+    --model dinov2 \
     --checkpoint checkpoints/v1_ovr_best.pt \
     --data-dir data \
     --metadata-dir datasets \

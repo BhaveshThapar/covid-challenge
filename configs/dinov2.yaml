@@ -1,8 +1,5 @@
-# Default config — aliases to dinov2 for backward compatibility.
-# Use configs/dinov2.yaml, configs/densenet.yaml, or configs/efficientnet.yaml
-# for model-specific settings. Use configs/ensemble.yaml for ensemble.
+# DINOv2 ViT-B/14 — Anant
 data:
-  data_dir: "data"
   image_size: 224
   slices_per_scan: 64
   num_workers: 8
