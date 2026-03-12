@@ -219,15 +219,18 @@ def _run_efficientnet(gpu_id: int, config_path: str, checkpoint: str, data_dir: 
 
 
 def _tune_weights_threshold(prob_dino, prob_dense, prob_eff, labels, sources,
-                            w_steps=11, t_steps=21):
+                            weight_step=0.01, t_steps=21):
     """Grid search over weights and threshold. Returns (best_weights, best_thresh, best_f1)."""
     from src.utils import compute_per_source_f1
     best_f1, best_w, best_t = 0.0, None, 0.5
-    for w1 in np.linspace(0, 1, w_steps):
-        for w2 in np.linspace(0, 1 - w1, w_steps):
-            w3 = 1 - w1 - w2
-            if w3 < 0:
+    eps = 1e-9
+    for w1 in np.arange(0.0, 1.0 + eps, weight_step):
+        for w2 in np.arange(0.0, (1.0 - w1) + eps, weight_step):
+            w3 = 1.0 - w1 - w2
+            if w3 < -eps:
                 continue
+            if w3 < 0.0:
+                w3 = 0.0
             weights = np.array([w1, w2, w3])
             prob_ens = weights[0] * prob_dino + weights[1] * prob_dense + weights[2] * prob_eff
             for t in np.linspace(0.3, 0.7, t_steps):
