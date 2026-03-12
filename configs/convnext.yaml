@@ -1,0 +1,21 @@
+# ConvNeXt-Tiny — backbone auto-detects embed_dim=768
+data:
+  image_size: 256
+  slices_per_scan: 48
+  num_workers: 4
+  pin_memory: true
+model:
+  backbone: "convnext_tiny"
+  embedding_dim: 768
+  attention_hidden_dim: 256
+  classifier_hidden_dim: 384
+  num_classes: 2
+  dropout: 0.5
+  drop_path_rate: 0.3
+phase2:
+  use_amp: true
+eval:
+  slices_per_scan: 48
+  batch_size: 1
+  threshold: 0.5
+seed: 42

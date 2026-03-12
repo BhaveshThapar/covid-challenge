@@ -1,16 +1,61 @@
-# Ensemble configuration — Majority vote (DINOv2, DenseNet, EfficientNet)
-# Each model predicts 0/1; final prediction = majority per scan
+# Ensemble configuration — all available models (9 total with SWA variants)
+# Strategy: 'avg' (probability averaging) or 'majority' (hard vote)
 
 ensemble:
-  threshold: 0.5  # threshold for binarizing each model's P(covid) before voting
+  strategy: avg           # probability averaging (recommended)
+  threshold: 0.5          # global default; per-source tuning overrides this on val
+  per_source_tune: true   # sweep per-source thresholds (val only)
 
 models:
+  # --- DINOv2 (slice-level sigmoid → mean) ---
   dinov2:
+    type: dinov2
     config: configs/dinov2.yaml
     checkpoint: checkpoints/v1_ovr_best.pt
+
+  # --- DenseNet (slice-level sigmoid → mean) ---
   densenet:
+    type: densenet
     config: configs/densenet.yaml
     checkpoint: checkpoints/v4_ovr_best.pt
-  efficientnet:
+
+  # --- EfficientNet-B3 variants (scan-level softmax) ---
+  eff_b3_s42:
+    type: efficientnet
     config: configs/efficientnet.yaml
-    checkpoint: checkpoints/best.pt
+    checkpoint: checkpoints/exp_b3_s42/best.pt
+
+  eff_b3_s7:
+    type: efficientnet
+    config: configs/efficientnet.yaml
+    checkpoint: checkpoints/exp_b3_s7/best.pt
+    seed_override: 7
+
+  eff_b3_s7_swa:
+    type: efficientnet
+    config: configs/efficientnet.yaml
+    checkpoint: checkpoints/exp_b3_s7/swa_best.pt
+    seed_override: 7
+
+  eff_b3_s123:
+    type: efficientnet
+    config: configs/efficientnet.yaml
+    checkpoint: checkpoints/exp_b3_s123/best.pt
+    seed_override: 123
+
+  # --- ConvNeXt-Tiny (scan-level softmax) ---
+  cnxt_s42:
+    type: efficientnet
+    config: configs/convnext.yaml
+    checkpoint: checkpoints/exp_cnxt_s42/best.pt
+
+  # --- EfficientNetV2-S (scan-level softmax) ---
+  effv2_s42:
+    type: efficientnet
+    config: configs/efficientnetv2.yaml
+    checkpoint: checkpoints/exp_effv2_s42/best.pt
+
+  effv2_s42_swa:
+    type: efficientnet
+    config: configs/efficientnetv2.yaml
+    checkpoint: checkpoints/exp_effv2_s42/swa_best.pt
