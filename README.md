@@ -1,186 +1,147 @@
 # Multi-Source Covid-19 Detection Challenge
 
-Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
+Binary COVID / non-COVID classification of chest CT scans across 4 hospital sources,
+for the **PHAROS-AIF-MIH** competition at **CVPR 2026**.
 
-## Architecture (aadit-dev-v4 branch)
+**Metric:** Average macro F1 across the 4 data centres.
 
-**DenseNet-121 + RadImageNet, slice-level training, scan-level evaluation:**
+---
+
+## Repository Branch Structure
+
+Each `final_*` branch trains a single backbone; checkpoints feed into `final_ensemble`.
 
 ```
-CT Slices → DenseNet-121 (RadImageNet) → Average Slice Probs → Threshold → Covid / Non-Covid
+final_EfficientNet_B3   ← EfficientNet-B3 Gated Attention MIL (4 seed/SWA variants)
+final_DenseNet-121      ← you are here
+final_dinoV2            ← Self-supervised DINOv2 ViT-B/14 (slice-level sigmoid)
+final_ConvNeXt          ← ConvNeXt-Tiny Gated Attention MIL
+final_EfficientNet_V2   ← EfficientNetV2-S Gated Attention MIL
+final_ensemble          ← Combines all 9 checkpoints → final submission
 ```
 
-Training uses progressive backbone unfreezing rather than a separate MIL aggregation stage.
-Scan-level predictions simply average per-slice sigmoid probabilities (no learned attention).
+The 9-model ensemble is described in `final_ensemble`; this branch produces **checkpoint `v4_ovr_best.pt`** used by model #2 in that ensemble.
 
-**Metric:** Average macro F1 across 4 data centres. Per-centre F1 is the macro average of per-class F1 scores for classes that have ground-truth samples in that centre (missing classes are skipped, not zeroed).
+---
 
-## Project Structure
+## This Branch: `final_DenseNet-121`
+
+### Architecture
+
+DenseNet-121 initialized from **RadImageNet** pretrained weights. Binary classification at the slice level; scan-level prediction via mean sigmoid averaging.
+
+```
+Phase 1 (frozen backbone, head-only):
+  CT Slice (224×224) → DenseNet-121 (frozen) → Dropout(0.4) → Linear(1024, 1) → BCE
+
+Phase 2a (unfreeze denseblock4 + norm5):
+  CT Slice (224×224) → DenseNet-121 (denseblock4 trainable) → Dropout(0.4) → Linear(1024, 1) → BCE
+
+Phase 2b (additionally unfreeze denseblock3 + transition3):
+  CT Slice (224×224) → DenseNet-121 (denseblock3+4 trainable) → Dropout(0.4) → Linear(1024, 1) → BCE
+
+Scan-level inference:
+  All slices → per-slice sigmoid → mean probability → threshold → COVID / non-COVID
+```
+
+### Training Details
+
+**Data loading:**
+- Slices are loaded from JPEG folders via `SliceDataset`
+- Each scan is capped at **64 slices** by deterministic uniform spacing (`np.linspace`)
+- Training uses `CenterBatchSampler` which balances by **both centre and class**: each batch of 32 contains 4 slices per `(centre, label)` group (4 centres × 2 classes × 4 slices = 32)
+- Smaller `(centre, label)` groups are oversampled with replacement each epoch
+
+**Phase 1 — Head-only (10 epochs):**
+- Backbone frozen; only `Dropout(0.4) → Linear(1024, 1)` trains
+- AdamW, lr=1e-3, weight_decay=1e-4
+- Linear warmup (1 epoch) → cosine annealing
+- Label smoothing ε=0.05; BCEWithLogitsLoss with pos_weight
+- No mixed precision (fast enough without)
+
+**Phase 2a — Unfreeze denseblock4 (15 epochs):**
+- Discriminative learning rates via `get_parameter_groups()`: head at 1e-3, denseblock4+norm5 at 1e-4
+- CosineAnnealingWarmRestarts (T₀=5)
+- bfloat16 mixed precision
+- Label smoothing ε=0.05
+
+**Phase 2b — Additionally unfreeze denseblock3 (15 epochs):**
+- Reloads best Phase 2a checkpoint
+- head at 1e-3, denseblock4+norm5 at 1e-4, denseblock3+transition3 at 3e-5
+- Same scheduler and precision as 2a
+- Best of Phase 2a vs 2b saved as `{run_name}_ovr_best.pt`
+
+**Validation:**
+- Scan-level: sample 48 slices per scan, average sigmoid probabilities, threshold at 0.5
+- Metric: per-source macro F1 averaged across 4 centres
+- TTA at final evaluation: 4 augmentations (identity, hflip, +15° rotate, −15° rotate)
+
+### Project Structure
 
 ```
 covid-challenge/
 ├── src/
-│   ├── model.py       # DenseNetCovidClassifier (DenseNet-121 + RadImageNet)
-│   ├── dataset.py     # SliceDataset, ScanDataset, CenterBatchSampler, TTA transforms
-│   ├── train.py       # Phase 1 (frozen) + Phase 2 (gradual unfreeze) training
-│   ├── evaluate.py    # Scan-level inference, threshold tuning, TTA, per-source F1
-│   └── utils.py       # Metrics, checkpointing, early stopping
+│   ├── model.py          DenseNetCovidClassifier (RadImageNet init, freeze/unfreeze helpers)
+│   ├── dataset.py         SliceDataset, ScanDataset, CenterBatchSampler (centre+class balanced), loaders
+│   ├── train.py           3-phase training: Phase 1, Phase 2a, Phase 2b (+ Phase 2b-only resume)
+│   ├── evaluate.py        Per-source macro F1, threshold tuning, TTA, confusion matrices
+│   └── utils.py           Seeding, config, logging, F1 metrics, CheckpointManager, EarlyStopping
 ├── scripts/
-│   └── download_and_extract.py  # gdown download + archive extraction + dataset analysis
+│   ├── download_and_extract.py      Download + extract competition archives
+│   └── download_and_extract_test.py Download + extract test set
 ├── slurm/
-│   ├── extract.sbatch    # Data download/extraction SLURM job (tron partition)
-│   └── train.sbatch      # GPU training SLURM job (tron partition, qos=medium)
+│   ├── extract.sbatch     Data extraction job
+│   ├── train.sbatch       Training job (all phases)
+│   ├── eval.sbatch        Evaluation job
+│   └── download_test.sbatch  Test data download job
 ├── configs/
-│   └── default.yaml      # Hyperparameters
-└── setup_env.sh           # Environment setup
+│   └── default.yaml       All hyperparameters
+└── setup_env.sh           Environment setup
 ```
 
-## Setup (on Nexus cluster)
+### File Details
+
+| File | Purpose |
+|------|---------|
+| `src/model.py` | `DenseNetCovidClassifier`: loads RadImageNet weights, replaces classifier with `Dropout(0.4) → Linear(1024, 1)`. Provides `freeze_backbone()`, `unfreeze_block()`, and `get_parameter_groups()` for discriminative LR. |
+| `src/dataset.py` | `SliceDataset` expands scans to slices (capped at 64). `CenterBatchSampler` groups slices by `(source, label)` and oversamples minority groups so each batch is balanced by both centre and class. `ScanDataset` + `scan_collate_fn` for scan-level validation with padding. `RawSliceScanDataset` for TTA. |
+| `src/train.py` | `train_phase1()` → frozen backbone. `_run_subphase()` → shared unfreezing logic. `train_phase2()` → orchestrates 2a and 2b. `train_phase2b_only()` → resume 2b from existing 2a checkpoint (for killed jobs). |
+| `src/evaluate.py` | Loads checkpoint, runs scan-level inference, sweeps threshold, prints per-source F1 and confusion matrices. Supports TTA via `get_tta_transforms()`. |
+| `src/utils.py` | `set_seed()`, `load_config()`, `compute_per_source_f1()` (excludes missing classes per challenge rules), `CheckpointManager`, `EarlyStopping`. |
+
+### Key Hyperparameters
+
+| Parameter | Phase 1 | Phase 2a | Phase 2b |
+|-----------|---------|----------|----------|
+| Backbone | DenseNet-121 (RadImageNet, frozen) | denseblock4 unfrozen | + denseblock3 unfrozen |
+| Image size | 224×224 | 224×224 | 224×224 |
+| Slices/scan (train) | 64 | 64 | 64 |
+| Batch size | 32 (via CenterBatchSampler) | 32 | 32 |
+| Head LR | 1e-3 | 1e-3 | 1e-3 |
+| Backbone LR | — | 1e-4 | 3e-5 (block3), 1e-4 (block4) |
+| Precision | FP32 | bfloat16 | bfloat16 |
+| Label smoothing | 0.05 | 0.05 | 0.05 |
+| Loss | BCE + pos_weight | BCE + pos_weight | BCE + pos_weight |
+| Scheduler | LinearWarmup → Cosine | CosineWarmRestarts (T₀=5) | CosineWarmRestarts (T₀=5) |
+
+### Usage
 
 ```bash
-# 1. Clone the aadit-dev branch
-cd /fs/nexus-scratch/aadit
-git clone -b aadit-dev https://github.com/BhaveshThapar/covid-challenge.git covid-challenge
-cd covid-challenge
-
-# 2. Create environment
+# Setup
 bash setup_env.sh
 
-# 3. Download RadImageNet DenseNet-121 weights
-source venv/bin/activate
-gdown --fuzzy "https://drive.google.com/file/d/1RHt2GnuOYlc_gcoTETtBDSW73mFyRAtR/view?usp=sharing" \
-      -O RadImageNet_pytorch.zip
-unzip -q RadImageNet_pytorch.zip -d radimagenet_weights
-cp radimagenet_weights/DenseNet121.pt checkpoints/radimagenet_densenet121.pt
+# Training (all phases)
+python src/train.py --config configs/default.yaml --phase 0 --run-name v4
+
+# Phase 2b only (resume from killed job)
+python src/train.py --config configs/default.yaml --phase 3 --run-name v4
+
+# Evaluation
+python src/evaluate.py --checkpoint checkpoints/v4_ovr_best.pt
 ```
 
-## Data
-
-Data is downloaded from Google Drive via gdown — no manual file placement needed.
-
-```bash
-# Extract data (submit SLURM job — tron partition, ~1-6 hours)
-sbatch slurm/extract.sbatch
-```
-
-Expected structure after extraction:
-```
-data/
-├── train/
-│   ├── covid/          # ct_scan_*/  folders of JPEG slices
-│   └── non_covid/
-└── val/
-    ├── covid/
-    └── non_covid/
-
-datasets/               # metadata CSVs live here (alongside raw archives)
-├── train_covid.csv
-├── train_non_covid.csv
-├── validation_covid.csv       # NOTE: named "validation_", not "val_"
-└── validation_non_covid.csv   # code handles both automatically
-```
-
-> **Note:** The metadata CSVs are in `datasets/` (alongside the raw archive files), **not**
-> `data/metadata/`. Always pass `--metadata-dir datasets` to train.py and evaluate.py.
-> The validation CSV names use `validation_*.csv`; the code tries `val_*.csv` first and
-> falls back to `validation_*.csv` automatically.
-
-## Training
-
-```bash
-# Submit full training job (Phase 1 → Phase 2 sequentially):
-export BASH_ENV=/usr/share/Modules/init/bash && sbatch slurm/train.sbatch
-
-# Run directly (debug / local):
-python src/train.py --config configs/default.yaml --phase 0
-```
-
-> **Partition:** `train.sbatch` targets `tron --qos=high --account=nexus` with an RTX A6000.
-> This avoids preemption and provides enough CPUs/RAM for `num_workers=8`.
-
-Training phases:
-- **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
-- **Phase 2a** (epochs 1–15): Unfreeze `denseblock4+norm5`, lr=1e-4
-- **Phase 2b** (epochs 1–15): Unfreeze `denseblock3+transition3`, lr=5e-5
-
-Checkpoints: `checkpoints/phase1_best.pt`, `checkpoints/phase2a_best.pt`, `checkpoints/phase2b_best.pt`, `checkpoints/best.pt`
-
-## Evaluation
-
-```bash
-python src/evaluate.py \
-    --config configs/default.yaml \
-    --checkpoint checkpoints/best.pt \
-    --data-dir data \
-    --metadata-dir datasets
-```
-
-Outputs per-source F1, tuned threshold, and final challenge score:
-```
-=======================================================
-PER-SOURCE MACRO F1 SCORES [No TTA]
-=======================================================
-    source_0: 0.xxxx
-    source_1: 0.xxxx
-    source_2: 0.xxxx
-    source_3: 0.xxxx
-     average: 0.xxxx  ★
-
-Tuned threshold (TTA):  0.xx  →  avg F1: 0.xxxx
-
-Final Challenge Score (P): 0.xxxx
-```
-
-Flags:
-- `--no-tta` — skip TTA (faster)
-- `--no-tune-threshold` — use default threshold of 0.5
-
-## Key Hyperparameters
-
-| Parameter | Value |
-|-----------|-------|
-| Backbone | DenseNet-121 (RadImageNet pretrained) |
-| Image size | 224×224 |
-| Slices/scan (training) | 64 (uniform sample) |
-| Slices/scan (fast val) | 48 |
-| Phase 1 LR | 1e-3 (head only) |
-| Phase 2a LR | 1e-4 (denseblock4) |
-| Phase 2b LR | 5e-5 (denseblock3) |
-| Loss | BCEWithLogitsLoss + label smoothing (ε=0.05) |
-| Grad clipping | max_norm=1.0 |
-| Batch sampler | Center + class balanced: equal covid & non-covid slices per centre per batch |
-| Threshold | Tuned on val (0.30–0.70 sweep) |
-| TTA | 4 augmentations (identity, hflip, rotate ±15°) |
-| Early stopping patience | 10 epochs |
-| AMP | bfloat16 on Ampere GPUs; falls back to float32 on Turing/Pascal |
-| Eval batch size | 1 scan at a time (prevents OOM on full-slice eval) |
-
-## Known Issues & Cluster Notes
-
-| Issue | Fix applied |
-|-------|-------------|
-| `val_covid.csv` not found (all sources = -1) | Code now tries `validation_*.csv` as fallback |
-| `FileNotFoundError: phase1_best.pt` (checkpoint rotation) | `save_named()` bypasses max_keep rotation |
-| `UnpicklingError` loading checkpoints (PyTorch 2.6) | `weights_only=False` in `CheckpointManager.load()` |
-| NaN loss in Phase 2 (float16 DenseNet overflow) | AMP uses bfloat16; falls back to float32 if unsupported |
-| OOM on full-slice validation (V100, 16 GB) | `full_val_every_n_epochs: 999`; `eval.batch_size: 1` |
-| 1-2 missing scan directories | Logged at startup, training continues without them |
-
-## Updating from Laptop → Nexus
-
-```bash
-# Laptop: make changes, commit, push
-git add -p && git commit -m "..." && git push
-
-# Nexus: pull latest
-cd /fs/nexus-scratch/aadit/covid-challenge
-git pull
-sbatch slurm/train.sbatch
-```
-
-## Requirements
+### Requirements
 
 - Python 3.10+
-- PyTorch 2.6+ + CUDA 11.8
-- SLURM cluster with GPU (tested on UMD Nexus, `tron` partition, qos=high, RTX A6000)
-- `unrar` system module: `module load unrar/7.0.9`
+- PyTorch 2.x + CUDA 11.8
+- SLURM cluster with GPU (tested on UMD Nexus, `scavenger` partition)
