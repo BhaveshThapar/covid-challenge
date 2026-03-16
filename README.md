@@ -1,216 +1,137 @@
 # Multi-Source Covid-19 Detection Challenge
 
-Binary Covid/Non-Covid classification of chest CT scans across 4 hospital sources.
+Binary COVID / non-COVID classification of chest CT scans across 4 hospital sources,
+for the **PHAROS-AIF-MIH** competition at **CVPR 2026**.
 
-## Architecture (DINOv2 branch)
+**Metric:** Average macro F1 across the 4 data centres.
 
-**DINOv2 ViT-B/14 + slice-level training, scan-level evaluation:**
+---
+
+## Repository Branch Structure
+
+Each `final_*` branch trains a single backbone; checkpoints feed into `final_ensemble`.
 
 ```
-CT Slices → DINOv2 ViT-B/14 (self-supervised) → Average Slice Probs → Threshold → Covid / Non-Covid
+final_EfficientNet_B3   ← EfficientNet-B3 Gated Attention MIL (4 seed/SWA variants)
+final_DenseNet-121      ← RadImageNet-pretrained DenseNet-121 (slice-level sigmoid)
+final_dinoV2            ← you are here
+final_ConvNeXt          ← ConvNeXt-Tiny Gated Attention MIL
+final_EfficientNet_V2   ← EfficientNetV2-S Gated Attention MIL
+final_ensemble          ← Combines all 9 checkpoints → final submission
 ```
 
-Training uses progressive backbone unfreezing (Phase 1: frozen; Phase 2a: last 2 blocks; Phase 2b: last 4 blocks).
-Scan-level predictions average per-slice sigmoid probabilities (no learned attention).
+This branch produces **checkpoint `v1_ovr_best.pt`** used by model #1 in the 9-model ensemble.
 
-**Metric:** Average macro F1 across 4 data centres
+---
 
-## Project Structure
+## This Branch: `final_dinoV2`
+
+### Architecture
+
+DINOv2 ViT-B/14 loaded from `facebookresearch/dinov2` via `torch.hub`. Self-supervised backbone (86M params, 768-dim CLS token, 14×14 patches). Binary classification at the slice level; scan-level prediction via mean sigmoid averaging.
+
+```
+Phase 1 (frozen backbone, head-only):
+  CT Slice (224×224) → DINOv2 ViT-B/14 (frozen) → Dropout(0.4) → Linear(768, 1) → BCE
+
+Phase 2a (unfreeze blocks.10, blocks.11, norm):
+  CT Slice (224×224) → DINOv2 (last 2 blocks trainable) → Dropout(0.4) → Linear(768, 1) → BCE
+
+Phase 2b (additionally unfreeze blocks.8, blocks.9):
+  CT Slice (224×224) → DINOv2 (last 4 blocks trainable) → Dropout(0.4) → Linear(768, 1) → BCE
+
+Scan-level inference:
+  All slices → per-slice sigmoid → mean probability → threshold → COVID / non-COVID
+```
+
+### Training Details
+
+**Data loading:**
+- Slices loaded from JPEG folders via `SliceDataset`
+- Each scan capped at **64 slices** by deterministic uniform spacing
+- Training uses `CenterBatchSampler` which balances by **centre only**: each batch of 32 contains 8 slices per centre (4 centres × 8 slices = 32)
+- Smaller centres oversampled with replacement each epoch
+
+**Phase 1 — Head-only (10 epochs):**
+- Backbone frozen; only `Dropout(0.4) → Linear(768, 1)` trains
+- AdamW, lr=1e-3, weight_decay=1e-4
+- Linear warmup (1 epoch) → cosine annealing
+- Label smoothing ε=0.05; BCEWithLogitsLoss with pos_weight
+- No mixed precision
+
+**Phase 2a — Unfreeze last 2 transformer blocks (15 epochs):**
+- `unfreeze_blocks_by_index([10, 11], also_norm=True)`
+- Discriminative LR: head at 1e-3, blocks.10+11+norm at 1e-4
+- CosineAnnealingWarmRestarts (T₀=5)
+- bfloat16 mixed precision
+- Gradient clipping (max_norm=1.0)
+
+**Phase 2b — Additionally unfreeze blocks.8 and blocks.9 (15 epochs):**
+- Reloads best Phase 2a checkpoint
+- blocks.8+9 at 5e-5, blocks.10+11+norm at 1e-4, head at 1e-3
+- Best of 2a vs 2b saved as `{run_name}_ovr_best.pt`
+
+**Validation:**
+- Scan-level: sample 48 slices, average sigmoid probabilities, threshold at 0.5
+- TTA at final evaluation: 4 augmentations (identity, hflip, +15° rotate, −15° rotate)
+
+### Project Structure
 
 ```
 covid-challenge/
 ├── src/
-│   ├── model.py       # DINOv2CovidClassifier (DINOv2 ViT-B/14)
-│   ├── dataset.py     # SliceDataset, ScanDataset, CenterBatchSampler, TTA transforms
-│   ├── train.py       # Phase 1 (frozen) + Phase 2 (gradual unfreeze) training
-│   ├── evaluate.py    # Scan-level inference, threshold tuning, TTA, per-source F1
-│   └── utils.py       # Metrics, checkpointing, early stopping
+│   ├── model.py          DINOv2CovidClassifier (torch.hub load, freeze/unfreeze by block index)
+│   ├── dataset.py         SliceDataset, ScanDataset, CenterBatchSampler (centre-balanced), loaders
+│   ├── train.py           3-phase training: Phase 1, Phase 2a, Phase 2b (+ 2b-only resume)
+│   ├── evaluate.py        Per-source macro F1, threshold tuning, TTA, confusion matrices
+│   ├── predict_test.py    Generate test-set predictions CSV
+│   └── utils.py           Seeding, config, logging, metrics, CheckpointManager, EarlyStopping
 ├── scripts/
-│   └── download_and_extract.py  # gdown download + archive extraction + dataset analysis
+│   └── download_and_extract.py   Download + extract competition archives
 ├── slurm/
-│   ├── extract.sbatch    # Data download/extraction SLURM job (tron partition)
-│   └── train.sbatch      # GPU training SLURM job (tron partition, qos=medium)
+│   ├── extract.sbatch     Data extraction
+│   ├── train.sbatch       Training (all phases)
+│   ├── eval.sbatch        Evaluation
+│   └── test.sbatch        Test-set inference
 ├── configs/
-│   └── default.yaml      # Hyperparameters
-└── setup_env.sh           # Environment setup
+│   └── default.yaml       Hyperparameters
+├── results/               Saved validation and test prediction CSVs
+└── setup_env.sh           Environment setup
 ```
 
-## Setup (on Nexus cluster)
+### File Details
+
+| File | Purpose |
+|------|---------|
+| `src/model.py` | `DINOv2CovidClassifier`: loads ViT-B/14 from torch hub, replaces head with `Dropout(0.4) → Linear(768, 1)`. `freeze_backbone()`, `unfreeze_blocks_by_index()`, `get_parameter_groups()` for discriminative LR across transformer blocks. |
+| `src/dataset.py` | `SliceDataset` expands scans to slices (capped at 64). `CenterBatchSampler` balances by centre, oversampling smaller centres. `ScanDataset` + `RawSliceScanDataset` for scan-level eval and TTA. |
+| `src/train.py` | `train_phase1()` → frozen backbone. `_run_subphase()` → shared unfreezing logic with discriminative LR. `train_phase2()` → 2a then 2b. `train_phase2b_only()` for resume. All phases use `build_slice_dataloaders()`. |
+| `src/evaluate.py` | Scan-level inference, threshold sweep, TTA, per-source F1, confusion matrices. |
+| `src/predict_test.py` | Generate `predictions.csv` for challenge test-set submission. |
+
+### Key Hyperparameters
+
+| Parameter | Phase 1 | Phase 2a | Phase 2b |
+|-----------|---------|----------|----------|
+| Backbone | DINOv2 ViT-B/14 (frozen) | blocks.10-11 + norm | + blocks.8-9 |
+| Image size | 224×224 | 224×224 | 224×224 |
+| Slices/scan (train) | 64 | 64 | 64 |
+| Batch size | 32 (CenterBatchSampler) | 32 | 32 |
+| Head LR | 1e-3 | 1e-3 | 1e-3 |
+| Block LR | — | 1e-4 | 5e-5 (8-9), 1e-4 (10-11) |
+| Precision | FP32 | bfloat16 | bfloat16 |
+| Scheduler | LinearWarmup → Cosine | CosineWarmRestarts (T₀=5) | CosineWarmRestarts (T₀=5) |
+
+### Usage
 
 ```bash
-# 1. Clone the Anant-dev branch
-cd /fs/nexus-scratch/anant04
-git clone -b Anant-dev https://github.com/BhaveshThapar/covid-challenge.git covid-challenge
-cd covid-challenge
-
-# 2. Create environment
 bash setup_env.sh
-
-# DINOv2 weights are downloaded automatically via torch.hub on first run (no manual download).
+python src/train.py --config configs/default.yaml --phase 0 --run-name v1
+python src/evaluate.py --checkpoint checkpoints/v1_ovr_best.pt
 ```
 
-## Data
-
-Data is downloaded from Google Drive via gdown — no manual file placement needed.
-
-```bash
-# Extract data (submit SLURM job — tron partition, ~1-6 hours)
-sbatch slurm/extract.sbatch
-```
-
-Expected structure after extraction:
-```
-data/
-├── train/
-│   ├── covid/          # ct_scan_*/  folders of JPEG slices
-│   └── non_covid/
-└── val/
-    ├── covid/
-    └── non_covid/
-
-datasets/               # metadata CSVs live here (alongside raw archives)
-├── train_covid.csv
-├── train_non_covid.csv
-├── validation_covid.csv       # NOTE: named "validation_", not "val_"
-└── validation_non_covid.csv   # code handles both automatically
-```
-
-> **Note:** The metadata CSVs are in `datasets/` (alongside the raw archive files), **not**
-> `data/metadata/`. Always pass `--metadata-dir datasets` to train.py and evaluate.py.
-> The validation CSV names use `validation_*.csv`; the code tries `val_*.csv` first and
-> falls back to `validation_*.csv` automatically.
-
-## Training
-
-```bash
-# Submit full training job (Phase 1 → Phase 2 sequentially):
-sbatch slurm/train.sbatch
-
-# Or submit Phase 2 only (if phase1_best.pt already exists):
-BASH_ENV=/usr/share/Modules/init/bash sbatch \
-  --job-name=covid-phase2 \
-  --partition=tron --account=nexus --qos=medium \
-  --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=10:00:00 \
-  --output=logs/phase2_%j.out --error=logs/phase2_%j.err \
-  --wrap='cd /fs/nexus-scratch/anant04/covid-challenge &&
-          source /usr/share/Modules/init/bash &&
-          module load Python3/3.10.14 &&
-          source venv/bin/activate &&
-          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-          python -u src/train.py --config configs/default.yaml \
-            --data-dir data --metadata-dir datasets --phase 2'
-
-# Run directly (debug / local):
-python src/train.py --config configs/default.yaml --phase 0
-```
-
-> **Partition:** Use `tron --qos=medium` (not `scavenger`) for training. Tron gives newer GPUs
-> (no preemption) and `--qos=medium` is required to get 8 CPUs + 64 GB RAM
-> (default QoS caps at 4 CPUs / 32 GB which is insufficient for `num_workers=8`).
-
-Training phases:
-- **Phase 1** (epochs 1–10): Frozen backbone, head-only, lr=1e-3
-- **Phase 2a** (epochs 1–15): Unfreeze last 2 blocks + norm, lr=1e-4
-- **Phase 2b** (epochs 1–15): Unfreeze last 4 blocks + norm, lr=5e-5
-
-Checkpoints: `checkpoints/{run_name}_phase1_best.pt`, `{run_name}_phase2a_best.pt`, `{run_name}_phase2b_best.pt`, `{run_name}_ovr_best.pt`
-
-## Evaluation
-
-```bash
-python src/evaluate.py \
-    --config configs/default.yaml \
-    --checkpoint checkpoints/v1_ovr_best.pt \
-    --data-dir data \
-    --metadata-dir datasets
-```
-
-Outputs per-source F1, tuned threshold, and final challenge score:
-```
-=======================================================
-PER-SOURCE MACRO F1 SCORES [No TTA]
-=======================================================
-    source_0: 0.xxxx
-    source_1: 0.xxxx
-    source_2: 0.xxxx
-    source_3: 0.xxxx
-     average: 0.xxxx  ★
-
-Tuned threshold (TTA):  0.xx  →  avg F1: 0.xxxx
-
-Final Challenge Score (P): 0.xxxx
-```
-
-Flags:
-- `--no-tta` — skip TTA (faster)
-- `--no-tune-threshold` — use default threshold of 0.5
-
-## Key Hyperparameters
-
-| Parameter | Value |
-|-----------|-------|
-| Backbone | DINOv2 ViT-B/14 (self-supervised, torch.hub) |
-| Image size | 224×224 |
-| Slices/scan (training) | 64 (uniform sample) |
-| Slices/scan (fast val) | 48 |
-| Phase 1 LR | 1e-3 (head only) |
-| Phase 2a LR | 1e-4 (blocks 10–11, norm) |
-| Phase 2b LR | 5e-5 (blocks 8–9) |
-| Loss | BCEWithLogitsLoss + label smoothing (ε=0.05) |
-| Grad clipping | max_norm=1.0 |
-| Batch sampler | Center-stratified (equal center representation) |
-| Threshold | Tuned on val (0.30–0.70 sweep) |
-| TTA | 4 augmentations (identity, hflip, rotate ±15°) |
-| Early stopping patience | 10 epochs |
-| AMP | bfloat16 on Ampere GPUs; falls back to float32 on Turing/Pascal |
-| Eval batch size | 1 scan at a time (prevents OOM on full-slice eval) |
-
-## Known Issues & Cluster Notes
-
-| Issue | Fix applied |
-|-------|-------------|
-| `val_covid.csv` not found (all sources = -1) | Code now tries `validation_*.csv` as fallback |
-| `FileNotFoundError: phase1_best.pt` (checkpoint rotation) | `save_named()` bypasses max_keep rotation |
-| `UnpicklingError` loading checkpoints (PyTorch 2.6) | `weights_only=False` in `CheckpointManager.load()` |
-| NaN loss in Phase 2 (float16 overflow) | AMP uses bfloat16; falls back to float32 if unsupported |
-| OOM on full-slice validation (V100, 16 GB) | `full_val_every_n_epochs: 999`; `eval.batch_size: 1` |
-| 1-2 missing scan directories | Logged at startup, training continues without them |
-
-## Test Set Inference
-
-The 1st challenge test set is included in the download script. After extraction, `data/test/` contains unlabeled scans.
-
-```bash
-# 1. Extract data (includes test) if not done:
-sbatch slurm/extract.sbatch
-
-# 2. Run test predictions (downloads test if missing, then predicts):
-sbatch slurm/test.sbatch
-```
-
-Output: `predictions_test.csv` with columns `scan_name`, `prediction` (0=non_covid, 1=covid), `prob_covid`.
-
-To use TTA or a custom threshold:
-```bash
-python src/predict_test.py --checkpoint checkpoints/v1_ovr_best.pt \
-    --output predictions_test.csv --threshold 0.5 --tta
-```
-
-## Updating from Laptop → Nexus
-
-```bash
-# Laptop: make changes, commit, push
-git add -p && git commit -m "..." && git push
-
-# Nexus: pull latest
-cd /fs/nexus-scratch/anant04/covid-challenge
-git pull
-sbatch slurm/train.sbatch
-```
-
-## Requirements
+### Requirements
 
 - Python 3.10+
-- PyTorch 2.6+ + CUDA 11.8
-- SLURM cluster with GPU (tested on UMD Nexus, `tron` partition, qos=medium)
-- `unrar` system module: `module load unrar/7.0.9`
+- PyTorch 2.x + CUDA 11.8
+- SLURM cluster with GPU (tested on UMD Nexus)
