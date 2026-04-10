@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
-#SBATCH --time=0:30:00
+#SBATCH --time=2:00:00
 #SBATCH --output=logs/gradcam_pp_%j.out
 #SBATCH --error=logs/gradcam_pp_%j.err
  
@@ -34,18 +34,26 @@ source venv/bin/activate
 
 # --- config ---
 CHECKPOINT="${CHECKPOINT:-checkpoints/exp_b3_s42/best.pt}"
-TOP_N="${TOP_N:-4}"
+# TOP_N=0 → all scans; TOP_N=4 → top-4 by confidence
+TOP_N="${TOP_N:-0}"
+# COVID_ONLY=1 → skip non-COVID scans
+COVID_ONLY="${COVID_ONLY:-1}"
 DATA_DIR="${DATA_DIR:-data}"
 METADATA_DIR="${METADATA_DIR:-datasets}"
 SPLIT="${SPLIT:-val}"
 OUTPUT_DIR="${OUTPUT_DIR:-figures}"
 DEVICE="${DEVICE:-cuda}"
 
-echo "=== Input x Gradient Saliency — Top-${TOP_N} per class ==="
-echo "Node:            $(hostname)"
-echo "Start:           $(date)"
-echo "CHECKPOINT:  $CHECKPOINT"
-echo "OUTPUT_DIR:  $OUTPUT_DIR"
+echo "=== Grad-CAM++ Saliency ==="
+echo "Node:         $(hostname)"
+echo "Start:        $(date)"
+echo "CHECKPOINT:   $CHECKPOINT"
+echo "OUTPUT_DIR:   $OUTPUT_DIR"
+echo "TOP_N:        ${TOP_N} (0=all)"
+echo "COVID_ONLY:   $COVID_ONLY"
+
+EXTRA_ARGS=""
+[ "$COVID_ONLY" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --covid-only"
 
 python scripts/run_gradcam_pp.py \
   --checkpoint "$CHECKPOINT" \
@@ -55,7 +63,8 @@ python scripts/run_gradcam_pp.py \
   --metadata-dir "$METADATA_DIR" \
   --split "$SPLIT" \
   --output-dir "$OUTPUT_DIR" \
-  --device "$DEVICE"
+  --device "$DEVICE" \
+  $EXTRA_ARGS
 
 echo "Done at $(date)"
 echo "Figures written to $OUTPUT_DIR/"

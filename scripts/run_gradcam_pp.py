@@ -162,16 +162,18 @@ def run_top_n_mode(args, cfg, model, device) -> None:
     scored = _infer_probs(model, entries, cfg, device)
     print(f"Scored {len(scored)} scans.")
 
-    # Top-N per class, sorted by model confidence
+    # Top-N per class, sorted by model confidence (top_n=0 → no limit, all scans)
+    _limit = args.top_n if args.top_n > 0 else None
+
     covid_rows = sorted(
         [r for r in scored if r["label"] == 0],
         key=lambda r: r["prob_covid"], reverse=True,   # highest = most confident COVID
-    )[:args.top_n]
+    )[:_limit]
 
-    noncovid_rows = sorted(
+    noncovid_rows = [] if args.covid_only else sorted(
         [r for r in scored if r["label"] == 1],
         key=lambda r: r["prob_covid"],                  # lowest = most confident non-COVID
-    )[:args.top_n]
+    )[:_limit]
 
     print(f"Selected {len(covid_rows)} COVID  and {len(noncovid_rows)} non-COVID scans.")
 
@@ -227,7 +229,8 @@ def run_top_n_mode(args, cfg, model, device) -> None:
                 "overlay":    overlay,
             })
 
-    if grid_entries:
+    # Only build a grid when N is small enough to be useful (≤ 8 per class)
+    if grid_entries and (args.top_n > 0 and args.top_n <= 8) and not args.covid_only:
         _save_grid(grid_entries, args.output_dir)
 
 
@@ -250,7 +253,10 @@ def main() -> None:
     # Top-N mode
     p.add_argument("--top-n-mode", action="store_true",
                    help="Saliency for top-N most confident correct predictions per class")
-    p.add_argument("--top-n", type=int, default=4)
+    p.add_argument("--top-n", type=int, default=4,
+                   help="How many scans per class (0 = all scans)")
+    p.add_argument("--covid-only", action="store_true",
+                   help="Only generate saliency for COVID scans (skip non-COVID)")
 
     # Single-scan debug mode
     p.add_argument("--scan-dir", type=str, default="")
