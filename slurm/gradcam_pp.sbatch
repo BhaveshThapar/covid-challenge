@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=covid-gradcam-pp
 #SBATCH --partition=tron
-#SBATCH --qos=premium
+#SBATCH --qos=high
+#SBATCH --account=nexus
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
@@ -27,12 +28,12 @@ cd "$REPO_ROOT"
 export TORCH_HOME="${TORCH_HOME:-/fs/nexus-scratch/aadit/.cache/torch}"
 mkdir -p "$TORCH_HOME" logs figures
 
+# Initialize module system (required on tron — not auto-sourced)
+source /etc/profile.d/modules.sh
 module load Python3/3.10.14
 source venv/bin/activate
 
 # --- config ---
-MODEL="${MODEL:-mil}"
-CONFIG="${CONFIG:-configs/efficientnet.yaml}"
 CHECKPOINT="${CHECKPOINT:-checkpoints/exp_b3_s42/best.pt}"
 TARGET="${TARGET:-covid}"
 DATA_DIR="${DATA_DIR:-data}"
@@ -44,14 +45,11 @@ DEVICE="${DEVICE:-cuda}"
 echo "=== Aggregate Grad-CAM++ saliency ==="
 echo "Node:       $(hostname)"
 echo "Start:      $(date)"
-echo "MODEL:      $MODEL"
 echo "CHECKPOINT: $CHECKPOINT"
 echo "TARGET:     $TARGET"
 echo "OUTPUT_DIR: $OUTPUT_DIR"
 
 python scripts/run_gradcam_pp.py \
-  --model "$MODEL" \
-  --config "$CONFIG" \
   --checkpoint "$CHECKPOINT" \
   --dataset-mode \
   --data-dir "$DATA_DIR" \
