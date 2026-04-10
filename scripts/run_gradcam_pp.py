@@ -42,7 +42,7 @@ from src.dataset import (  # noqa: E402
     get_val_transforms,
 )
 from src.gradcam_pp import (  # noqa: E402
-    mil_gradcam_pp,
+    mil_input_gradient,
     overlay_heatmap_on_rgb,
     save_side_by_side,
 )
@@ -151,7 +151,7 @@ def run_dataset_mode(args, cfg, model, device) -> None:
         slice_idx = int(attn0[0].argmax().item())
 
         try:
-            rgb, _, _, _, cam_np = mil_gradcam_pp(
+            rgb, _, _, _, cam_np = mil_input_gradient(
                 model, x, mask,
                 slice_index=slice_idx,
                 target_class=target_class,
@@ -261,7 +261,7 @@ def main() -> None:
         slice_idx = int(args.slice_index)
         log_str = f"slice {slice_idx}"
 
-    rgb, overlay, logits, attn, _ = mil_gradcam_pp(
+    rgb, overlay, logits, attn, _ = mil_input_gradient(
         model, x, mask,
         slice_index=slice_idx,
         target_class=target_class,

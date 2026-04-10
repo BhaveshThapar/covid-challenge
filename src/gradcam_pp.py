@@ -205,3 +205,67 @@ def mil_gradcam_pp(
     rgb = tensor_to_rgb_uint8(x[0, slice_index])
     overlay = overlay_heatmap_on_rgb(rgb, cam_np)
     return rgb, overlay, logits.detach(), attn.detach(), cam_np
+
+
+def mil_input_gradient(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    slice_index: int,
+    target_class: int = 0,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, np.ndarray]:
+    """
+    Input × Gradient saliency at full input resolution (H, W) — no upsampling.
+
+    Computes |d(score)/d(input) × input| for the chosen slice and reduces
+    over the 3 RGB channels by taking the max. Full 300×300 output.
+
+    Args:
+        model: CovidDetector (EfficientNet-B3 MIL)
+        x: (1, K, 3, H, W)
+        mask: (1, K) — 1 = valid slice
+        slice_index: which slice to visualize (use max-attention slice)
+        target_class: 0 = COVID, 1 = non-COVID
+        device: torch device
+
+    Returns:
+        rgb_uint8:    (H, W, 3) denormalized input slice
+        overlay_uint8:(H, W, 3) saliency overlaid on rgb
+        logits:       (1, 2) detached
+        attention:    (1, K) detached
+        sal_np:       (H, W) float32 [0, 1] raw saliency (for aggregation)
+    """
+    from src.models.efficientnet import CovidDetector
+
+    if not isinstance(model, CovidDetector):
+        raise TypeError("model must be CovidDetector (EfficientNet MIL)")
+
+    if hasattr(model.backbone, "set_grad_checkpointing"):
+        model.backbone.set_grad_checkpointing(enable=False)
+
+    model.eval()
+    x = x.to(device).detach().requires_grad_(True)
+    mask = mask.to(device)
+
+    logits, attn = model(x, mask)
+    model.zero_grad(set_to_none=True)
+    score = logits[0, target_class]
+    score.backward()
+
+    # Gradient and input for the target slice
+    grad = x.grad[0, slice_index]       # (3, H, W)
+    inp  = x[0, slice_index].detach()   # (3, H, W)
+
+    # |grad × input|, collapse channels by max → (H, W)
+    saliency = (grad * inp).abs().max(dim=0)[0]
+
+    s_min, s_max = saliency.min(), saliency.max()
+    if s_max > s_min:
+        saliency = (saliency - s_min) / (s_max - s_min + 1e-8)
+
+    sal_np = saliency.detach().cpu().numpy().astype(np.float32)
+    rgb = tensor_to_rgb_uint8(inp)
+    overlay = overlay_heatmap_on_rgb(rgb, sal_np)
+    return rgb, overlay, logits.detach(), attn.detach(), sal_np
