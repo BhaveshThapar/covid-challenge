@@ -162,6 +162,12 @@ def run_dataset_mode(args, cfg, model, device) -> None:
             skipped += 1
             continue
 
+        # Clip top 1% per-scan to suppress border/padding artifacts
+        # before accumulating, so no single outlier scan dominates the mean.
+        p99 = np.percentile(cam_np, 99)
+        if p99 > 0:
+            cam_np = np.clip(cam_np, 0.0, p99) / p99
+
         if cam_sum[label] is None:
             cam_sum[label] = cam_np.astype(np.float64)
             img_sum[label] = rgb.astype(np.float64)

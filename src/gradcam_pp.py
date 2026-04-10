@@ -111,17 +111,24 @@ def save_side_by_side(
     plt.close(fig)
 
 
-def _mil_spatial_layer(backbone: torch.nn.Module) -> torch.nn.Module:
-    """Last spatial layer before global pool for timm EfficientNet backbones."""
-    if hasattr(backbone, "bn2"):
-        return backbone.bn2
-    if hasattr(backbone, "act2"):
-        return backbone.act2
-    raise AttributeError(
-        "Could not find backbone.bn2 or backbone.act2. "
-        "Only efficientnet_b3 and tf_efficientnetv2_s are supported. "
-        "convnext_tiny uses LayerNorm and is not compatible."
-    )
+def _mil_spatial_layer(backbone: torch.nn.Module, block_index: int = -5) -> torch.nn.Module:
+    """
+    Return the EfficientNet-B3 block to hook for Grad-CAM++.
+
+    blocks[-5] = blocks[2] at 300x300 input → ~38x38 spatial resolution.
+    This is 3x sharper than bn2 (10x10) with still-meaningful semantics.
+
+    EfficientNet-B3 spatial sizes at 300x300 input:
+        blocks[0]: 150x150  blocks[1]: 75x75   blocks[2]: 38x38
+        blocks[3]: 19x19    blocks[4]: 19x19   blocks[5]: 19x19
+        blocks[6]: 10x10    bn2:       10x10
+    """
+    if not hasattr(backbone, "blocks"):
+        raise AttributeError(
+            "backbone has no 'blocks' attribute. "
+            "Only efficientnet_b3 is supported (convnext_tiny is not compatible)."
+        )
+    return backbone.blocks[block_index]
 
 
 def mil_gradcam_pp(
