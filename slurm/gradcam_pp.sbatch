@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:rtxa6000:1
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
-#SBATCH --time=0:30:00
+#SBATCH --time=1:00:00
 #SBATCH --output=logs/gradcam_pp_%j.out
 #SBATCH --error=logs/gradcam_pp_%j.err
  

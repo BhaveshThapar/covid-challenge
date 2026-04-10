@@ -273,28 +273,37 @@ def mil_input_gradient(
     slice_index: int,
     target_class: int = 0,
     device: torch.device,
+    n_smooth: int = 20,
+    noise_level: float = 0.15,
+    blur_sigma: float = 6.0,
 ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, np.ndarray]:
     """
-    Input × Gradient saliency at full input resolution (H, W) — no upsampling.
+    SmoothGrad saliency at full input resolution (H, W) — no upsampling.
 
-    Computes |d(score)/d(input) × input| for the chosen slice and reduces
-    over the 3 RGB channels by taking the max. Full 300×300 output.
+    Adds Gaussian noise to the input n_smooth times, averages the squared
+    gradients across all runs (SmoothGrad), then applies a Gaussian blur.
+    This removes the salt-and-pepper noise that vanilla input×gradient produces
+    and yields coherent region-level saliency maps.
 
     Args:
-        model: CovidDetector (EfficientNet-B3 MIL)
-        x: (1, K, 3, H, W)
-        mask: (1, K) — 1 = valid slice
-        slice_index: which slice to visualize (use max-attention slice)
-        target_class: 0 = COVID, 1 = non-COVID
-        device: torch device
+        model:       CovidDetector (EfficientNet-B3 MIL)
+        x:           (1, K, 3, H, W)
+        mask:        (1, K) — 1 = valid slice
+        slice_index: which slice to visualize
+        target_class:0 = COVID, 1 = non-COVID
+        device:      torch device
+        n_smooth:    number of noisy samples to average (default 20)
+        noise_level: noise std as fraction of input range (default 0.15)
+        blur_sigma:  Gaussian blur sigma in pixels applied after averaging (default 6)
 
     Returns:
         rgb_uint8:    (H, W, 3) denormalized input slice
         overlay_uint8:(H, W, 3) saliency overlaid on rgb
-        logits:       (1, 2) detached
-        attention:    (1, K) detached
-        sal_np:       (H, W) float32 [0, 1] raw saliency (for aggregation)
+        logits:       (1, 2) detached — from the clean (noise-free) forward pass
+        attention:    (1, K) detached — from the clean forward pass
+        sal_np:       (H, W) float32 [0, 1] smoothed saliency
     """
+    from scipy.ndimage import gaussian_filter
     from src.models.efficientnet import CovidDetector
 
     if not isinstance(model, CovidDetector):
@@ -304,26 +313,41 @@ def mil_input_gradient(
         model.backbone.set_grad_checkpointing(enable=False)
 
     model.eval()
-    x = x.to(device).detach().requires_grad_(True)
+    x = x.to(device)
     mask = mask.to(device)
 
-    logits, attn = model(x, mask)
-    model.zero_grad(set_to_none=True)
-    score = logits[0, target_class]
-    score.backward()
+    # Clean forward pass — used for logits, attn, and noise scale
+    with torch.no_grad():
+        logits, attn = model(x, mask)
 
-    # Gradient and input for the target slice
-    grad = x.grad[0, slice_index]       # (3, H, W)
-    inp  = x[0, slice_index].detach()   # (3, H, W)
+    x_range = x.max() - x.min()
+    stdev = float(noise_level * x_range.item())
 
-    # |grad × input|, collapse channels by max → (H, W)
-    saliency = (grad * inp).abs().max(dim=0)[0]
+    # SmoothGrad: accumulate squared gradients over noisy samples
+    sal_sum = np.zeros(x.shape[3:], dtype=np.float64)  # (H, W)
 
-    s_min, s_max = saliency.min(), saliency.max()
+    for _ in range(n_smooth):
+        x_noisy = (x + torch.randn_like(x) * stdev).detach().requires_grad_(True)
+        lg, _ = model(x_noisy, mask)
+        model.zero_grad(set_to_none=True)
+        lg[0, target_class].backward()
+
+        # Squared gradient, max over channels → (H, W)
+        grad = x_noisy.grad[0, slice_index]          # (3, H, W)
+        sal  = grad.pow(2).max(dim=0)[0]
+        sal_sum += sal.detach().cpu().numpy().astype(np.float64)
+
+    sal_np = (sal_sum / n_smooth).astype(np.float32)
+
+    # Gaussian blur to remove remaining high-frequency noise
+    sal_np = gaussian_filter(sal_np, sigma=blur_sigma).astype(np.float32)
+
+    # Normalize to [0, 1]
+    s_min, s_max = sal_np.min(), sal_np.max()
     if s_max > s_min:
-        saliency = (saliency - s_min) / (s_max - s_min + 1e-8)
+        sal_np = (sal_np - s_min) / (s_max - s_min + 1e-8)
 
-    sal_np = saliency.detach().cpu().numpy().astype(np.float32)
+    inp = x[0, slice_index].detach()
     rgb = tensor_to_rgb_uint8(inp)
     overlay = overlay_heatmap_on_rgb(rgb, sal_np)
     return rgb, overlay, logits.detach(), attn.detach(), sal_np
