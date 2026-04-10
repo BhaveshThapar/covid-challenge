@@ -74,9 +74,27 @@ def tensor_to_rgb_uint8(tchw: torch.Tensor) -> np.ndarray:
 
 
 def overlay_heatmap_on_rgb(
-    rgb: np.ndarray, cam_01: np.ndarray, alpha: float = 0.45, colormap: str = "jet",
+    rgb: np.ndarray,
+    cam_01: np.ndarray,
+    max_alpha: float = 0.75,
+    colormap: str = "hot",
+    low_threshold: float = 0.25,
 ) -> np.ndarray:
-    """Overlay a [0,1] CAM on an HxWx3 uint8 image. Returns uint8 HxWx3."""
+    """
+    Saliency-proportional alpha overlay on an HxWx3 uint8 CT image.
+
+    Alpha scales with the saliency value so low-activation regions are fully
+    transparent (CT anatomy shows through) and only high-activation regions
+    get the colored overlay. Colormap 'hot' (black→red→yellow→white) works
+    well on dark CT backgrounds without flooding the image with blue.
+
+    Args:
+        rgb:           (H, W, 3) uint8 base CT image
+        cam_01:        (H, W) float32 saliency in [0, 1]
+        max_alpha:     maximum opacity at saliency=1.0 (default 0.75)
+        colormap:      matplotlib colormap (default "hot")
+        low_threshold: saliency below this is fully transparent (default 0.25)
+    """
     import matplotlib
 
     if hasattr(matplotlib, "colormaps"):
@@ -84,8 +102,15 @@ def overlay_heatmap_on_rgb(
     else:
         import matplotlib.cm as cm
         cmap = cm.get_cmap(colormap)
+
     heat = (cmap(cam_01)[:, :, :3] * 255.0).astype(np.float32)
-    out = (1.0 - alpha) * rgb.astype(np.float32) + alpha * heat
+
+    # Alpha scales with saliency; zero below threshold so CT shows through
+    alpha_map = np.where(cam_01 < low_threshold, 0.0, cam_01 * max_alpha)
+    alpha_map = alpha_map[:, :, np.newaxis]   # (H, W, 1) for broadcasting
+
+    base = rgb.astype(np.float32)
+    out = (1.0 - alpha_map) * base + alpha_map * heat
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -207,6 +232,26 @@ def mil_gradcam_pp(
     return rgb, overlay, logits.detach(), attn.detach(), cam_np
 
 
+def _clahe_enhance(rgb: np.ndarray) -> np.ndarray:
+    """
+    Apply CLAHE to a uint8 RGB image and return a contrast-enhanced grayscale uint8 array.
+
+    Converts to luminance, applies CLAHE (clip_limit=0.03, tile_grid 8×8), returns uint8.
+    Falls back to simple percentile stretch if skimage is unavailable.
+    """
+    gray = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]).astype(np.float32)
+    try:
+        from skimage.exposure import equalize_adapthist
+        gray_norm = gray / 255.0
+        enhanced = equalize_adapthist(gray_norm, clip_limit=0.03, nbins=256)
+        return (enhanced * 255.0).astype(np.uint8)
+    except ImportError:
+        # Percentile stretch fallback: map p1–p99 to [0, 255]
+        p1, p99 = np.percentile(gray, [1, 99])
+        stretched = np.clip((gray - p1) / (p99 - p1 + 1e-8), 0.0, 1.0)
+        return (stretched * 255.0).astype(np.uint8)
+
+
 def save_individual_saliency(
     rgb: np.ndarray,
     overlay: np.ndarray,
@@ -218,10 +263,12 @@ def save_individual_saliency(
     attn_weight: float,
 ) -> None:
     """
-    Two-panel figure per scan: CT slice | saliency overlay with colorbar + contour.
+    Two-panel figure per scan: CLAHE-enhanced CT | Grad-CAM++ overlay.
 
-    Contour drawn at the 75th percentile of the saliency map to clearly
-    mark the regions contributing most to the model's prediction.
+    Left panel: CLAHE contrast-enhanced grayscale — makes lung parenchyma and
+    ground-glass opacities clearly visible against the dark CT background.
+    Right panel: saliency-proportional alpha overlay (hot colormap) + white
+    contour at the 75th-percentile saliency level.
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
@@ -229,11 +276,13 @@ def save_individual_saliency(
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
+    clahe_gray = _clahe_enhance(rgb)   # (H, W) uint8, high contrast
+
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 
-    # Left: original CT
-    axes[0].imshow(rgb, cmap="gray")
-    axes[0].set_title("CT slice (max attention)", fontsize=11)
+    # Left: CLAHE-enhanced CT (gray colormap on single-channel array)
+    axes[0].imshow(clahe_gray, cmap="gray", vmin=0, vmax=255)
+    axes[0].set_title("CT slice — CLAHE enhanced", fontsize=11)
     axes[0].axis("off")
 
     # Right: saliency overlay
@@ -243,12 +292,12 @@ def save_individual_saliency(
     threshold = np.percentile(sal_np, 75)
     axes[1].contour(sal_np, levels=[threshold], colors="white", linewidths=1.2, alpha=0.85)
 
-    axes[1].set_title("Input × Gradient saliency", fontsize=11)
+    axes[1].set_title("Grad-CAM++", fontsize=11)
     axes[1].axis("off")
 
-    # Colorbar
+    # Colorbar matching the "hot" colormap used in overlay_heatmap_on_rgb
     norm = Normalize(vmin=0, vmax=1)
-    sm = cm.ScalarMappable(cmap="jet", norm=norm)
+    sm = cm.ScalarMappable(cmap="hot", norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
     cbar.set_label("Saliency", fontsize=9)

@@ -140,7 +140,7 @@ def _save_grid(entries: list[dict], output_dir: str) -> None:
             ax.axis("off")
         axes[col, 0].set_ylabel(class_name, fontsize=11, labelpad=8)
 
-    plt.suptitle("Input × Gradient Saliency  |  EfficientNet-B3 MIL  |  Top-4 by confidence",
+    plt.suptitle("Grad-CAM++  |  EfficientNet-B3 MIL  |  Top-4 by confidence",
                  fontsize=12)
     plt.tight_layout()
     out_path = os.path.join(output_dir, "saliency_top4_grid.png")
@@ -233,7 +233,7 @@ def run_top_n_mode(args, cfg, model, device) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Input × Gradient saliency for EfficientNet-B3 MIL."
+        description="Grad-CAM++ saliency for EfficientNet-B3 MIL."
     )
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Checkpoint path (use checkpoints/exp_b3_s42/best.pt)")
@@ -292,7 +292,7 @@ def main() -> None:
     )
     probs = torch.softmax(logits, dim=1)[0]
     right_title = (
-        f"Input × Gradient  |  slice {slice_idx}  |  "
+        f"Grad-CAM++  |  slice {slice_idx}  |  "
         f"P(covid)={probs[0]:.3f}  attn={attn[0, slice_idx]:.3f}"
     )
     save_side_by_side(rgb, overlay, args.output,
