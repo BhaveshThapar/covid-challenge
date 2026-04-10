@@ -207,6 +207,64 @@ def mil_gradcam_pp(
     return rgb, overlay, logits.detach(), attn.detach(), cam_np
 
 
+def save_individual_saliency(
+    rgb: np.ndarray,
+    overlay: np.ndarray,
+    sal_np: np.ndarray,
+    out_path: str,
+    scan_name: str,
+    prob_covid: float,
+    true_class: str,
+    attn_weight: float,
+) -> None:
+    """
+    Two-panel figure per scan: CT slice | saliency overlay with colorbar + contour.
+
+    Contour drawn at the 75th percentile of the saliency map to clearly
+    mark the regions contributing most to the model's prediction.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    from matplotlib.colors import Normalize
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+    # Left: original CT
+    axes[0].imshow(rgb, cmap="gray")
+    axes[0].set_title("CT slice (max attention)", fontsize=11)
+    axes[0].axis("off")
+
+    # Right: saliency overlay
+    axes[1].imshow(overlay)
+
+    # Contour at 75th percentile to mark top contributing regions
+    threshold = np.percentile(sal_np, 75)
+    axes[1].contour(sal_np, levels=[threshold], colors="white", linewidths=1.2, alpha=0.85)
+
+    axes[1].set_title("Input × Gradient saliency", fontsize=11)
+    axes[1].axis("off")
+
+    # Colorbar
+    norm = Normalize(vmin=0, vmax=1)
+    sm = cm.ScalarMappable(cmap="jet", norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar.set_label("Saliency", fontsize=9)
+    cbar.set_ticks([0, 0.5, 1])
+    cbar.set_ticklabels(["Low", "Mid", "High"])
+
+    title = (
+        f"{scan_name}  |  true: {true_class}  |  "
+        f"P(covid)={prob_covid:.3f}  |  attn={attn_weight:.3f}"
+    )
+    fig.suptitle(title, fontsize=10)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def mil_input_gradient(
     model: torch.nn.Module,
     x: torch.Tensor,
