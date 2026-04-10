@@ -34,7 +34,6 @@ source venv/bin/activate
 
 # --- config ---
 CHECKPOINT="${CHECKPOINT:-checkpoints/exp_b3_s42/best.pt}"
-PREDICTIONS_CSV="${PREDICTIONS_CSV:-results/predictions_ensemble_val.csv}"
 TOP_N="${TOP_N:-4}"
 DATA_DIR="${DATA_DIR:-data}"
 METADATA_DIR="${METADATA_DIR:-datasets}"
@@ -45,15 +44,13 @@ DEVICE="${DEVICE:-cuda}"
 echo "=== Input x Gradient Saliency — Top-${TOP_N} per class ==="
 echo "Node:            $(hostname)"
 echo "Start:           $(date)"
-echo "CHECKPOINT:      $CHECKPOINT"
-echo "PREDICTIONS_CSV: $PREDICTIONS_CSV"
-echo "OUTPUT_DIR:      $OUTPUT_DIR"
+echo "CHECKPOINT:  $CHECKPOINT"
+echo "OUTPUT_DIR:  $OUTPUT_DIR"
 
 python scripts/run_gradcam_pp.py \
   --checkpoint "$CHECKPOINT" \
   --top-n-mode \
   --top-n "$TOP_N" \
-  --predictions-csv "$PREDICTIONS_CSV" \
   --data-dir "$DATA_DIR" \
   --metadata-dir "$METADATA_DIR" \
   --split "$SPLIT" \

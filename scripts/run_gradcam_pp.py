@@ -22,7 +22,6 @@ Single-scan mode (debugging):
 from __future__ import annotations
 
 import argparse
-import csv
 import os
 import sys
 
@@ -91,16 +90,28 @@ def _build_model(cfg: dict, checkpoint: str, device: torch.device) -> CovidDetec
     return model.to(device)
 
 
-def _load_predictions_csv(csv_path: str) -> dict:
-    """Returns {scan_name: {"prob_covid": float, "prediction": int}}."""
-    result = {}
-    with open(csv_path) as f:
-        for row in csv.DictReader(f):
-            result[row["scan_name"]] = {
-                "prob_covid": float(row["prob_covid"]),
-                "prediction": int(row["prediction"]),
-            }
-    return result
+def _infer_probs(model: CovidDetector, entries: list, cfg: dict, device: torch.device) -> list:
+    """
+    Run inference on all entries with no_grad and return entries augmented
+    with prob_covid.  Uses the same model that will compute saliency, so
+    confidence scores are consistent with the saliency maps.
+    """
+    from tqdm import tqdm
+
+    image_size     = int(cfg["data"]["image_size"])
+    slices_per_scan = int(cfg["eval"]["slices_per_scan"])
+    model.eval()
+    results = []
+    for entry in tqdm(entries, desc="Inference"):
+        try:
+            x, mask = _load_mil_scan(entry["scan_dir"], image_size, slices_per_scan, device)
+        except (FileNotFoundError, RuntimeError):
+            continue
+        with torch.no_grad():
+            logits, attn = model(x, mask)
+        prob_covid = float(torch.softmax(logits, dim=1)[0, 0].item())
+        results.append({**entry, "prob_covid": prob_covid, "attn": attn})
+    return results
 
 
 def _save_grid(entries: list[dict], output_dir: str) -> None:
@@ -142,37 +153,24 @@ def run_top_n_mode(args, cfg, model, device) -> None:
     image_size = int(cfg["data"]["image_size"])
     k = int(cfg["eval"]["slices_per_scan"])
 
-    # Load ground truth from manifest
+    # Use scan_dir as the unique key — avoids scan_name collisions between classes
     entries = build_scan_manifest(args.data_dir, args.split, args.metadata_dir)
-    gt_map  = {e["scan_name"]: e["label"]    for e in entries}
-    dir_map = {e["scan_name"]: e["scan_dir"] for e in entries}
+    print(f"Manifest: {len(entries)} scans total.")
 
-    # Load ensemble confidence scores
-    preds = _load_predictions_csv(args.predictions_csv)
+    # Run inference with the actual EfficientNet model to get per-scan probabilities.
+    # This is consistent with the saliency model and avoids ambiguous CSV matching.
+    scored = _infer_probs(model, entries, cfg, device)
+    print(f"Scored {len(scored)} scans.")
 
-    # Build combined rows: {scan_name, label, prob_covid, prediction, scan_dir}
-    rows = []
-    for scan_name, p in preds.items():
-        if scan_name not in gt_map:
-            continue
-        rows.append({
-            "scan_name":  scan_name,
-            "label":      gt_map[scan_name],       # 0=covid, 1=noncovid
-            "scan_dir":   dir_map[scan_name],
-            "prob_covid": p["prob_covid"],
-            "prediction": p["prediction"],
-            "correct":    p["prediction"] == gt_map[scan_name],
-        })
-
-    # Top-N correctly classified per class, sorted by confidence
+    # Top-N per class, sorted by model confidence
     covid_rows = sorted(
-        [r for r in rows if r["label"] == 0 and r["correct"]],
-        key=lambda r: r["prob_covid"], reverse=True,
+        [r for r in scored if r["label"] == 0],
+        key=lambda r: r["prob_covid"], reverse=True,   # highest = most confident COVID
     )[:args.top_n]
 
     noncovid_rows = sorted(
-        [r for r in rows if r["label"] == 1 and r["correct"]],
-        key=lambda r: r["prob_covid"],   # lowest prob_covid = most confident non-COVID
+        [r for r in scored if r["label"] == 1],
+        key=lambda r: r["prob_covid"],                  # lowest = most confident non-COVID
     )[:args.top_n]
 
     print(f"Selected {len(covid_rows)} COVID  and {len(noncovid_rows)} non-COVID scans.")
@@ -185,7 +183,6 @@ def run_top_n_mode(args, cfg, model, device) -> None:
         (0, "covid",    covid_rows),
         (1, "noncovid", noncovid_rows),
     ]:
-        target_class = class_label
         for row in selected:
             scan_name = row["scan_name"]
             print(f"  Processing {scan_name}  (P(covid)={row['prob_covid']:.3f})")
@@ -196,15 +193,15 @@ def run_top_n_mode(args, cfg, model, device) -> None:
                 print(f"    Skip: {e}")
                 continue
 
-            with torch.no_grad():
-                _, attn0 = model(x, mask)
+            # Use the cached attention from inference pass to pick the slice
+            attn0 = row["attn"]
             slice_idx = int(attn0[0].argmax().item())
 
             try:
                 rgb, overlay, logits, attn, sal_np = mil_input_gradient(
                     model, x, mask,
                     slice_index=slice_idx,
-                    target_class=target_class,
+                    target_class=class_label,
                     device=device,
                 )
             except Exception as e:
@@ -254,8 +251,6 @@ def main() -> None:
     p.add_argument("--top-n-mode", action="store_true",
                    help="Saliency for top-N most confident correct predictions per class")
     p.add_argument("--top-n", type=int, default=4)
-    p.add_argument("--predictions-csv", type=str,
-                   default="results/predictions_ensemble_val.csv")
 
     # Single-scan debug mode
     p.add_argument("--scan-dir", type=str, default="")
