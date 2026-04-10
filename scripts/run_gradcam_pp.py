@@ -44,6 +44,15 @@ from src.gradcam_pp import (  # noqa: E402
     save_individual_saliency,
     save_side_by_side,
 )
+
+def _upsample_sal(sal_np: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Bilinear upsample float32 (H, W) saliency to (out_h, out_w)."""
+    from PIL import Image
+    pil = Image.fromarray((sal_np * 255.0).astype(np.uint8)).resize(
+        (out_w, out_h), Image.BILINEAR
+    )
+    result = np.array(pil).astype(np.float32) / 255.0
+    return result
 from src.models import CovidDetector  # noqa: E402
 from src.utils import CheckpointManager, load_config, set_seed  # noqa: E402
 
@@ -52,7 +61,8 @@ CONFIG = "configs/efficientnet.yaml"
 
 def _load_mil_scan(
     scan_dir: str, image_size: int, slices_per_scan: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, list]:
+    """Returns (x, mask, paths) where paths[i] is the disk path for tensor slice i."""
     paths = _get_sorted_slices(scan_dir)
     if not paths:
         raise FileNotFoundError(f"No slice images in {scan_dir}")
@@ -61,17 +71,19 @@ def _load_mil_scan(
         paths = [paths[i] for i in idx]
     tfm = get_val_transforms(image_size)
     tensors = []
+    valid_paths = []
     for p in paths:
         arr = _load_image_safe(p)
         if arr is None:
             continue
         tensors.append(tfm(image=arr)["image"])
+        valid_paths.append(p)
     if not tensors:
         raise RuntimeError(f"No readable slice images in {scan_dir}")
     vol = torch.stack(tensors, dim=0)
     x = vol.unsqueeze(0).to(device)
     mask = torch.ones(1, vol.shape[0], device=device)
-    return x, mask
+    return x, mask, valid_paths
 
 
 def _build_model(cfg: dict, checkpoint: str, device: torch.device) -> CovidDetector:
@@ -104,7 +116,7 @@ def _infer_probs(model: CovidDetector, entries: list, cfg: dict, device: torch.d
     results = []
     for entry in tqdm(entries, desc="Inference"):
         try:
-            x, mask = _load_mil_scan(entry["scan_dir"], image_size, slices_per_scan, device)
+            x, mask, _ = _load_mil_scan(entry["scan_dir"], image_size, slices_per_scan, device)
         except (FileNotFoundError, RuntimeError):
             continue
         with torch.no_grad():
@@ -190,7 +202,7 @@ def run_top_n_mode(args, cfg, model, device) -> None:
             print(f"  Processing {scan_name}  (P(covid)={row['prob_covid']:.3f})")
 
             try:
-                x, mask = _load_mil_scan(row["scan_dir"], image_size, k, device)
+                x, mask, slice_paths = _load_mil_scan(row["scan_dir"], image_size, k, device)
             except (FileNotFoundError, RuntimeError) as e:
                 print(f"    Skip: {e}")
                 continue
@@ -200,7 +212,7 @@ def run_top_n_mode(args, cfg, model, device) -> None:
             slice_idx = int(attn0[0].argmax().item())
 
             try:
-                rgb, overlay, logits, attn, sal_np = mil_gradcam_pp(
+                _rgb, _overlay, logits, attn, sal_np = mil_gradcam_pp(
                     model, x, mask,
                     slice_index=slice_idx,
                     target_class=class_label,
@@ -210,11 +222,24 @@ def run_top_n_mode(args, cfg, model, device) -> None:
                 print(f"    Saliency failed: {e}")
                 continue
 
+            # Load the original (pre-transform) slice at native disk resolution
+            orig = _load_image_safe(slice_paths[slice_idx])
+            if orig is not None:
+                orig_h, orig_w = orig.shape[:2]
+                sal_native = _upsample_sal(sal_np, orig_h, orig_w)
+                rgb_display = orig
+                overlay_display = overlay_heatmap_on_rgb(orig, sal_native)
+            else:
+                # Fallback to the 300×300 transformed version
+                sal_native = sal_np
+                rgb_display = _rgb
+                overlay_display = _overlay
+
             out_path = os.path.join(
                 args.output_dir, f"saliency_{class_name}_{scan_name}.png"
             )
             save_individual_saliency(
-                rgb, overlay, sal_np, out_path,
+                rgb_display, overlay_display, sal_native, out_path,
                 scan_name=scan_name,
                 prob_covid=row["prob_covid"],
                 true_class=class_name,
@@ -226,7 +251,7 @@ def run_top_n_mode(args, cfg, model, device) -> None:
                 "scan_name":  scan_name,
                 "true_class": class_name,
                 "prob_covid": row["prob_covid"],
-                "overlay":    overlay,
+                "overlay":    overlay_display,
             })
 
     # Only build a grid when N is small enough to be useful (≤ 8 per class)
@@ -281,7 +306,7 @@ def main() -> None:
     k            = int(cfg["eval"]["slices_per_scan"])
     target_class = 0 if args.target == "covid" else 1
 
-    x, mask = _load_mil_scan(args.scan_dir, image_size, k, device)
+    x, mask, _ = _load_mil_scan(args.scan_dir, image_size, k, device)
     model.eval()
     if args.slice_index == "max_attn":
         with torch.no_grad():
