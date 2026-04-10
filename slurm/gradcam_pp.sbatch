@@ -9,7 +9,7 @@
 #SBATCH --time=0:30:00
 #SBATCH --output=logs/gradcam_pp_%j.out
 #SBATCH --error=logs/gradcam_pp_%j.err
-
+ 
 # Input x Gradient saliency — top-4 most confident correct predictions per class.
 # Outputs (in figures/):
 #   saliency_covid_ct_scan_XXX.png      (4 files)
